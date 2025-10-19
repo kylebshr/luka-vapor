@@ -11,6 +11,8 @@ let package = Package(
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.0"),
         // 🔵 Non-blocking, event-driven networking for Swift. Used for custom executors
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
+        .package(url: "https://github.com/swift-server-community/APNSwift", from: "6.1.0"),
+        .package(url: "https://github.com/kylebshr/dexcom-swift", branch: "main"),
     ],
     targets: [
         .executableTarget(
@@ -19,6 +21,8 @@ let package = Package(
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "APNS", package: "APNSwift"),
+                .product(name: "Dexcom", package: "dexcom-swift"),
             ],
             swiftSettings: swiftSettings
         ),
