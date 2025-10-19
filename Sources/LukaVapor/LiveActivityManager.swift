@@ -15,7 +15,7 @@ actor LiveActivityManager {
         environment: PushEnvironment,
         duration: Int,
         app: Application
-    ) async {
+    ) {
         // Cancel existing session if present
         if let existingTask = activeSessions[sessionID] {
             existingTask.cancel()
@@ -43,6 +43,8 @@ actor LiveActivityManager {
         if let task = activeSessions.removeValue(forKey: sessionID) {
             task.cancel()
             app.logger.info("Stopped polling for session: \(sessionID)")
+        } else {
+            app.logger.info("Not polling for session: \(sessionID)")
         }
     }
 

@@ -1,9 +1,18 @@
 #!/bin/bash
 
-curl -X POST http://127.0.0.1:8080/start-live-activity \
+SERVER=${1:-localhost}
+
+# Add protocol and port if needed
+if [[ $SERVER == "localhost" ]]; then
+  URL="http://localhost:8080"
+else
+  URL="https://$SERVER"
+fi
+
+curl -X POST "$URL/start-live-activity" \
   -H "Content-Type: application/json" \
   -d '{
-    "pushToken": "80449c6abdc5dc0590a462dc0b845c38fd2d056c2b636d0f1287ec64bf98ebdd8113865795e880a8aee3071d58ae89ba8e068f3016e497eda046b3fa4e65122321e9c5888c2bf511cd9768a7ef1b14f8",
+    "pushToken": "8070bd88b9f2cf3f61b7e276ad9bcf313612a121704602728748791cf1d7606435af6d762ed19caa0313fb08898fd55c94fe708b262c8a2542ef433f0df0d10e47e89ffb5a1995baab529a8d8245810e",
     "accountID": "3D511AEA-9550-4826-B0F9-EAF1F1F51CDD",
     "sessionID": "933A5C2B-81B9-48E3-A860-1CC7AC1C7ED8",
     "accountLocation": "usa",
