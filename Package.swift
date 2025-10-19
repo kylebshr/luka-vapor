@@ -1,4 +1,4 @@
-// swift-tools-version:6.0
+// swift-tools-version:6.2
 import PackageDescription
 
 let package = Package(
@@ -13,6 +13,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/swift-server-community/APNSwift", from: "6.1.0"),
         .package(url: "https://github.com/kylebshr/dexcom-swift", branch: "main"),
+        .package(url: "https://github.com/vapor/apns", from: "5.0.0"),
     ],
     targets: [
         .executableTarget(
@@ -23,6 +24,7 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "APNS", package: "APNSwift"),
                 .product(name: "Dexcom", package: "dexcom-swift"),
+                .product(name: "VaporAPNS", package: "apns"),
             ],
             swiftSettings: swiftSettings
         ),

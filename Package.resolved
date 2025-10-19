@@ -1,6 +1,15 @@
 {
-  "originHash" : "fb6836638d32529591e311434b852d7a99f51ab5e2b1f6d1b41fcd186e53f4c4",
+  "originHash" : "79c66ee259d333a78c46f8954edf97583abf82ebd23b3ede6f99b5150914f2ff",
   "pins" : [
+    {
+      "identity" : "apns",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/vapor/apns",
+      "state" : {
+        "revision" : "be523e3dc2a054d1ab51cb610c015dbbffb1d1ac",
+        "version" : "5.0.0"
+      }
+    },
     {
       "identity" : "apnswift",
       "kind" : "remoteSourceControl",

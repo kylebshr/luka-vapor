@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(curl:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(source ~/.zshrc)"
     ],
     "deny": [],
     "ask": []
