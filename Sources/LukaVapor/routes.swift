@@ -11,48 +11,31 @@ func routes(_ app: Application) throws {
         "Hello, world!"
     }
 
-    app.post("start-live-activity") { req async throws in
-        let body = try req.content.decode(StartLiveActivityRequest.self)
+    app.post("end-live-activity") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(EndLiveActivityRequest.self)
 
-        let client = DexcomClient(
-            username: nil,
-            password: nil,
-            existingAccountID: body.accountID,
-            existingSessionID: body.sessionID,
-            accountLocation: body.accountLocation
+        await req.application.liveActivityManager.stopPolling(
+            sessionID: body.sessionID,
+            app: req.application
         )
 
-        let readings = try await client.getGlucoseReadings(
-            duration: .init(value: body.duration, unit: .hours)
-        ).sorted { $0.date < $1.date }
+        return .ok
+    }
 
-        let state = LiveActivityState(c: readings.last, h: readings.map {
-            .init(t: $0.date, v: Int16($0.value))
-        })
+    app.post("start-live-activity") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        let apnsClient = switch body.environment {
-        case .development: await app.apns.client(.development)
-        case .production: await app.apns.client(.production)
-        }
+        // Start background polling
+        await req.application.liveActivityManager.startPolling(
+            sessionID: body.sessionID,
+            accountID: body.accountID,
+            accountLocation: body.accountLocation,
+            pushToken: body.pushToken,
+            environment: body.environment,
+            duration: Int(body.duration),
+            app: req.application
+        )
 
-        do {
-            try await apnsClient.sendLiveActivityNotification(
-                .init(
-                    expiration: .immediately,
-                    priority: .immediately,
-                    appID: "com.kylebashour.Glimpse",
-                    contentState: state,
-                    event: .update,
-                    timestamp: Int(Date.now.timeIntervalSince1970),
-                    dismissalDate: .none,
-                    apnsID: nil
-                ),
-                deviceToken: body.pushToken
-            )
-        } catch {
-            print(error)
-        }
-
-        return HTTPStatus.ok
+        return .ok
     }
 }
