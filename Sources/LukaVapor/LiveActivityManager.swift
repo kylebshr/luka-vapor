@@ -13,7 +13,7 @@ actor LiveActivityManager {
         accountLocation: AccountLocation,
         pushToken: String,
         environment: PushEnvironment,
-        duration: Int,
+        durationHours: Int,
         app: Application
     ) {
         // Cancel existing session if present
@@ -30,7 +30,7 @@ actor LiveActivityManager {
                 accountLocation: accountLocation,
                 pushToken: pushToken,
                 environment: environment,
-                duration: duration,
+                durationHours: durationHours,
                 app: app
             )
         }
@@ -54,7 +54,7 @@ actor LiveActivityManager {
         accountLocation: AccountLocation,
         pushToken: String,
         environment: PushEnvironment,
-        duration: Int,
+        durationHours: Int,
         app: Application
     ) async {
         var lastReadingDate: Date?
@@ -75,7 +75,7 @@ actor LiveActivityManager {
 
                 // Fetch latest readings
                 let readings = try await client.getGlucoseReadings(
-                    duration: .init(value: Double(duration), unit: .hours)
+                    duration: .init(value: Double(durationHours), unit: .hours)
                 ).sorted { $0.date < $1.date }
 
                 guard let latestReading = readings.last else {
