@@ -4,7 +4,7 @@
 #
 
 app = 'luka-vapor'
-primary_region = 'iad'
+primary_region = 'sjc'
 
 [build]
 
