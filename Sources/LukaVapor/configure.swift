@@ -30,7 +30,7 @@ public func configure(_ app: Application) async throws {
             keyIdentifier: keyID,
             teamIdentifier: teamID
         ),
-        environment: .development
+        environment: .production
     )
 
     await app.apns.containers.use(
