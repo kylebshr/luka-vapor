@@ -5,21 +5,21 @@ import APNSCore
 import Foundation
 
 actor LiveActivityManager {
-    private var activeSessions: [UUID: Task<Void, Never>] = [:]
+    private var activeSessions: [LiveActivityPushToken: Task<Void, Never>] = [:]
 
     func startPolling(
         sessionID: UUID,
         accountID: UUID,
         accountLocation: AccountLocation,
-        pushToken: String,
+        pushToken: LiveActivityPushToken,
         environment: PushEnvironment,
         durationHours: Int,
         app: Application
     ) {
         // Cancel existing session if present
-        if let existingTask = activeSessions[sessionID] {
+        if let existingTask = activeSessions[pushToken] {
             existingTask.cancel()
-            app.logger.info("Cancelled existing session: \(sessionID)")
+            app.logger.info("Cancelled existing session: \(sessionID) token: \(pushToken)")
         }
 
         // Spawn background polling task
@@ -35,16 +35,16 @@ actor LiveActivityManager {
             )
         }
 
-        activeSessions[sessionID] = task
-        app.logger.info("Started polling for session: \(sessionID)")
+        activeSessions[pushToken] = task
+        app.logger.info("Started polling for session: \(sessionID) token: \(pushToken)")
     }
 
-    func stopPolling(sessionID: UUID, app: Application) {
-        if let task = activeSessions.removeValue(forKey: sessionID) {
+    func stopPolling(pushToken: LiveActivityPushToken, sessionID: UUID, app: Application) {
+        if let task = activeSessions.removeValue(forKey: pushToken) {
             task.cancel()
-            app.logger.info("Stopped polling for session: \(sessionID)")
+            app.logger.info("Stopped polling for session: \(sessionID) token: \(pushToken)")
         } else {
-            app.logger.info("Not polling for session: \(sessionID)")
+            app.logger.info("Not polling for session: \(sessionID) token: \(pushToken)")
         }
     }
 
@@ -52,7 +52,7 @@ actor LiveActivityManager {
         sessionID: UUID,
         accountID: UUID,
         accountLocation: AccountLocation,
-        pushToken: String,
+        pushToken: LiveActivityPushToken,
         environment: PushEnvironment,
         durationHours: Int,
         app: Application
@@ -79,7 +79,7 @@ actor LiveActivityManager {
                 ).sorted { $0.date < $1.date }
 
                 guard let latestReading = readings.last else {
-                    app.logger.warning("No readings available for session: \(sessionID)")
+                    app.logger.warning("No readings available for session: \(sessionID) token: \(pushToken)")
                     try await Task.sleep(for: .seconds(pollInterval))
                     pollInterval = min(pollInterval * 1.5, maxInterval)
                     continue
@@ -98,7 +98,7 @@ actor LiveActivityManager {
                     } else {
                         // Still within normal reading window, wait for next expected reading
                         let timeUntilNextReading = readingInterval - timeSinceLastReading
-                        app.logger.info("Next reading expected in \(Int(timeUntilNextReading))s for session: \(sessionID)")
+                        app.logger.info("Next reading expected in \(Int(timeUntilNextReading))s for session: \(sessionID) token: \(pushToken)")
                         try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval)))
                         pollInterval = minInterval // Reset backoff
                     }
@@ -136,21 +136,21 @@ actor LiveActivityManager {
                             staleDate: Int(Date.now.addingTimeInterval(60 * 7).timeIntervalSince1970),
                             apnsID: nil
                         ),
-                        deviceToken: pushToken
+                        deviceToken: pushToken.rawValue
                     )
-                    app.logger.info("Sent Live Activity update for session: \(sessionID)")
+                    app.logger.info("Sent Live Activity update for session: \(sessionID) token: \(pushToken)")
                 } catch let error as APNSCore.APNSError {
                     app.logger.error("APNS error for session \(sessionID): \(error)")
                     // If token is invalid, stop polling
                     if error.reason == .badDeviceToken || error.reason == .unregistered {
-                        app.logger.warning("Live Activity ended, stopping polling for session: \(sessionID)")
+                        app.logger.warning("Live Activity ended, stopping polling for session: \(sessionID) token: \(pushToken)")
                         break
                     }
                 } catch {
                     app.logger.error("Unexpected error sending push for session \(sessionID): \(error)")
                 }
             } catch is CancellationError {
-                app.logger.info("Polling cancelled for session: \(sessionID)")
+                app.logger.info("Polling cancelled for session: \(sessionID) token: \(pushToken)")
                 break
             } catch {
                 app.logger.error("Error polling for session \(sessionID): \(error)")
@@ -160,11 +160,11 @@ actor LiveActivityManager {
             }
         }
 
-        self.cleanupSession(sessionID)
+        self.cleanupSession(pushToken)
     }
 
-    private func cleanupSession(_ sessionID: UUID) {
-        activeSessions.removeValue(forKey: sessionID)
+    private func cleanupSession(_ pushToken: LiveActivityPushToken) {
+        activeSessions.removeValue(forKey: pushToken)
     }
 }
 
