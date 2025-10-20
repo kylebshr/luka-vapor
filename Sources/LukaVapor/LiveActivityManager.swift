@@ -63,16 +63,22 @@ actor LiveActivityManager {
         let maxInterval: TimeInterval = 60 // Cap at 60 seconds
         let readingInterval: TimeInterval = 60 * 5 // 5 minutes between readings
 
+        // Send push notification
+        let apnsClient = switch environment {
+        case .development: await app.apns.client(.development)
+        case .production: await app.apns.client(.production)
+        }
+
+        nonisolated(unsafe) let client = DexcomClient(
+            username: nil,
+            password: nil,
+            existingAccountID: accountID,
+            existingSessionID: sessionID,
+            accountLocation: accountLocation
+        )
+
         while !Task.isCancelled {
             do {
-                nonisolated(unsafe) let client = DexcomClient(
-                    username: nil,
-                    password: nil,
-                    existingAccountID: accountID,
-                    existingSessionID: sessionID,
-                    accountLocation: accountLocation
-                )
-
                 // Fetch latest readings
                 let readings = try await client.getGlucoseReadings(
                     duration: .init(value: Double(durationHours), unit: .hours)
@@ -117,16 +123,10 @@ actor LiveActivityManager {
                     h: readings.map { .init(t: $0.date, v: Int16($0.value)) }
                 )
 
-                // Send push notification
-                let apnsClient = switch environment {
-                case .development: await app.apns.client(.development)
-                case .production: await app.apns.client(.production)
-                }
-
                 do {
                     try await apnsClient.sendLiveActivityNotification(
                         .init(
-                            expiration: .immediately,
+                            expiration: .none,
                             priority: .immediately,
                             appID: "com.kylebashour.Glimpse",
                             contentState: state,
@@ -142,15 +142,36 @@ actor LiveActivityManager {
                 } catch let error as APNSCore.APNSError {
                     app.logger.error("APNS error for session \(sessionID): \(error)")
                     // If token is invalid, stop polling
-                    if error.reason == .badDeviceToken || error.reason == .unregistered {
-                        app.logger.warning("Live Activity ended, stopping polling for session: \(sessionID) token: \(pushToken)")
-                        break
+                    if let reason = error.reason {
+                        if reason == .badDeviceToken || error.reason == .unregistered {
+                            app.logger.warning("Live Activity ended because \(reason.reason), stopping polling for session: \(sessionID) token: \(pushToken)")
+                            break
+                        }
                     }
                 } catch {
                     app.logger.error("Unexpected error sending push for session \(sessionID): \(error)")
                 }
             } catch is CancellationError {
                 app.logger.info("Polling cancelled for session: \(sessionID) token: \(pushToken)")
+                break
+            } catch let error as DexcomClientError {
+                app.logger.error("Ending polling due to DexcomClientError: \(error)")
+
+                _ = try? await apnsClient.sendLiveActivityNotification(
+                    .init(
+                        expiration: .none,
+                        priority: .immediately,
+                        appID: "com.kylebashour.Glimpse",
+                        contentState: LiveActivityState(c: nil, h: []),
+                        event: .update,
+                        timestamp: Int(Date.now.timeIntervalSince1970),
+                        dismissalDate: .immediately,
+                        staleDate: nil,
+                        apnsID: nil
+                    ),
+                    deviceToken: pushToken.rawValue
+                )
+
                 break
             } catch {
                 app.logger.error("Error polling for session \(sessionID): \(error)")
