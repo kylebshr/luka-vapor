@@ -16,6 +16,9 @@ primary_region = 'sjc'
   min_machines_running = 1
   processes = ['app']
 
+[env]
+  LOG_LEVEL = debug
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
