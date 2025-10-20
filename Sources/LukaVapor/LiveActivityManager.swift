@@ -39,12 +39,12 @@ actor LiveActivityManager {
         app.logger.info("Started polling for session: \(sessionID) token: \(pushToken)")
     }
 
-    func stopPolling(pushToken: LiveActivityPushToken, sessionID: UUID, app: Application) {
+    func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
         if let task = activeSessions.removeValue(forKey: pushToken) {
             task.cancel()
-            app.logger.info("Stopped polling for session: \(sessionID) token: \(pushToken)")
+            app.logger.info("Stopped polling for token: \(pushToken)")
         } else {
-            app.logger.info("Not polling for session: \(sessionID) token: \(pushToken)")
+            app.logger.info("Not polling for token: \(pushToken)")
         }
     }
 

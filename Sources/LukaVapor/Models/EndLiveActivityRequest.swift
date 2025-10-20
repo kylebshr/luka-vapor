@@ -8,5 +8,5 @@
 import Foundation
 
 struct EndLiveActivityRequest: Codable {
-    var sessionID: UUID
+    var pushToken: LiveActivityPushToken
 }

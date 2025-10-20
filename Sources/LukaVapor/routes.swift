@@ -11,6 +11,17 @@ func routes(_ app: Application) throws {
         "Hello, world!"
     }
 
+    app.post("end-live-activity") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(EndLiveActivityRequest.self)
+
+        await req.application.liveActivityManager.stopPolling(
+            pushToken: body.pushToken,
+            app: app
+        )
+
+        return .ok
+    }
+
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
