@@ -17,7 +17,7 @@ primary_region = 'sjc'
   processes = ['app']
 
 [env]
-  LOG_LEVEL = debug
+  LOG_LEVEL = 'debug'
 
 [[vm]]
   memory = '1gb'
