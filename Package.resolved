@@ -1,5 +1,5 @@
 {
-  "originHash" : "79c66ee259d333a78c46f8954edf97583abf82ebd23b3ede6f99b5150914f2ff",
+  "originHash" : "a4106754d97ac5776b9433ea1d77e6064bd4e8b3b571e941c469a005325555fb",
   "pins" : [
     {
       "identity" : "apns",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/swift-server-community/APNSwift",
       "state" : {
-        "revision" : "f407b435d28456c2568cc2713a226cd06a5d5736",
-        "version" : "6.1.0"
+        "branch" : "main",
+        "revision" : "e73454a559249577ef745266939cbf1aa88eb519"
       }
     },
     {

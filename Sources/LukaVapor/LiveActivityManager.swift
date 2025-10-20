@@ -133,6 +133,7 @@ actor LiveActivityManager {
                             event: .update,
                             timestamp: Int(Date.now.timeIntervalSince1970),
                             dismissalDate: .none,
+                            staleDate: Int(Date.now.addingTimeInterval(60 * 7).timeIntervalSince1970),
                             apnsID: nil
                         ),
                         deviceToken: pushToken
