@@ -32,7 +32,7 @@ func routes(_ app: Application) throws {
             accountLocation: body.accountLocation,
             pushToken: body.pushToken,
             environment: body.environment,
-            durationHours: body.durationHours,
+            duration: body.duration,
             app: req.application
         )
 
