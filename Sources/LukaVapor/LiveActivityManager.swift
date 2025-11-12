@@ -19,7 +19,7 @@ actor LiveActivityManager {
         // Cancel existing session if present
         if let existingTask = activeSessions[pushToken] {
             existingTask.cancel()
-            app.logger.info("Cancelled existing session: \(sessionID) token: \(pushToken)")
+            app.logger.debug("Cancelled existing session: \(sessionID) token: \(pushToken)")
         }
 
         // Spawn background polling task
@@ -36,15 +36,15 @@ actor LiveActivityManager {
         }
 
         activeSessions[pushToken] = task
-        app.logger.info("Started polling for session: \(sessionID) token: \(pushToken)")
+        app.logger.info("Started Live Activity polling")
     }
 
     func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
         if let task = activeSessions.removeValue(forKey: pushToken) {
             task.cancel()
-            app.logger.info("Stopped polling for token: \(pushToken)")
+            app.logger.debug("Stopped polling for token: \(pushToken)")
         } else {
-            app.logger.info("Not polling for token: \(pushToken)")
+            app.logger.debug("Not polling for token: \(pushToken)")
         }
     }
 
@@ -98,13 +98,13 @@ actor LiveActivityManager {
 
                     if timeSinceLastReading > readingInterval {
                         // Reading is overdue, increase polling frequency with backoff
-                        app.logger.info("Waiting for new reading (last: \(lastDate), current: \(latestReading.date)) - polling in \(Int(pollInterval))s")
+                        app.logger.debug("Waiting for new reading (last: \(lastDate), current: \(latestReading.date)) - polling in \(Int(pollInterval))s")
                         try await Task.sleep(for: .seconds(pollInterval))
                         pollInterval = min(pollInterval * 1.5, maxInterval)
                     } else {
                         // Still within normal reading window, wait for next expected reading
                         let timeUntilNextReading = readingInterval - timeSinceLastReading
-                        app.logger.info("Next reading expected in \(Int(timeUntilNextReading))s for session: \(sessionID) token: \(pushToken)")
+                        app.logger.debug("Next reading expected in \(Int(timeUntilNextReading))s for session: \(sessionID) token: \(pushToken)")
                         try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval)))
                         pollInterval = minInterval // Reset backoff
                     }
@@ -115,7 +115,7 @@ actor LiveActivityManager {
                 lastReadingDate = latestReading.date
                 pollInterval = minInterval // Reset backoff
 
-                app.logger.info("New reading for session \(sessionID): \(latestReading.value) at \(latestReading.date)")
+                app.logger.debug("New reading for session \(sessionID): \(latestReading.value) at \(latestReading.date)")
 
                 // Build Live Activity state
                 let state = LiveActivityState(
@@ -138,7 +138,7 @@ actor LiveActivityManager {
                         ),
                         deviceToken: pushToken.rawValue
                     )
-                    app.logger.info("Sent Live Activity update for session: \(sessionID) token: \(pushToken)")
+                    app.logger.debug("Sent Live Activity update for session: \(sessionID) token: \(pushToken)")
                 } catch let error as APNSCore.APNSError {
                     app.logger.error("APNS error for session \(sessionID): \(error)")
                     // If token is invalid, stop polling
@@ -152,7 +152,7 @@ actor LiveActivityManager {
                     app.logger.error("Unexpected error sending push for session \(sessionID): \(error)")
                 }
             } catch is CancellationError {
-                app.logger.info("Polling cancelled for session: \(sessionID) token: \(pushToken)")
+                app.logger.debug("Polling cancelled for session: \(sessionID) token: \(pushToken)")
                 break
             } catch let error as DexcomClientError {
                 app.logger.error("Ending polling due to DexcomClientError: \(error)")
