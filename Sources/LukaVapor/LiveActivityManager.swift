@@ -19,7 +19,7 @@ actor LiveActivityManager {
         // Cancel existing session if present
         if let existingTask = activeSessions[pushToken] {
             existingTask.cancel()
-            app.logger.debug("Cancelled existing session: \(sessionID) token: \(pushToken)")
+            app.logger.info("Cancelled existing session: \(sessionID) token: \(pushToken)")
         }
 
         // Spawn background polling task
@@ -40,6 +40,8 @@ actor LiveActivityManager {
     }
 
     func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
+        app.logger.info("Ending Live Activity session explicitly")
+
         if let task = activeSessions.removeValue(forKey: pushToken) {
             task.cancel()
             app.logger.debug("Stopped polling for token: \(pushToken)")
@@ -143,8 +145,9 @@ actor LiveActivityManager {
                     app.logger.error("APNS error for session \(sessionID): \(error)")
                     // If token is invalid, stop polling
                     if let reason = error.reason {
-                        if reason == .badDeviceToken || error.reason == .unregistered {
-                            app.logger.warning("Live Activity ended because \(reason.reason), stopping polling for session: \(sessionID) token: \(pushToken)")
+                        // "ExpiredToken" is not yet supported by APNSWift
+                        if reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
+                            app.logger.info("Live Activity ended because \(reason.reason), stopping polling")
                             break
                         }
                     }
@@ -163,7 +166,7 @@ actor LiveActivityManager {
                         priority: .immediately,
                         appID: "com.kylebashour.Glimpse",
                         contentState: LiveActivityState(c: nil, h: []),
-                        event: .update,
+                        event: .end,
                         timestamp: Int(Date.now.timeIntervalSince1970),
                         dismissalDate: .immediately,
                         staleDate: nil,
