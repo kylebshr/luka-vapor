@@ -160,15 +160,18 @@ actor LiveActivityManager {
             } catch let error as DexcomClientError {
                 app.logger.error("Ending polling due to DexcomClientError: \(error)")
 
+                // The client tried to refresh the session, but we don't have a username or password.
+                let sessionExpired = error == .noUsernameOrPassword
+
                 _ = try? await apnsClient.sendLiveActivityNotification(
                     .init(
                         expiration: .none,
                         priority: .immediately,
                         appID: "com.kylebashour.Glimpse",
-                        contentState: LiveActivityState(c: nil, h: []),
+                        contentState: LiveActivityState(c: nil, h: [], se: sessionExpired),
                         event: .end,
                         timestamp: Int(Date.now.timeIntervalSince1970),
-                        dismissalDate: .immediately,
+                        dismissalDate: .none,
                         staleDate: nil,
                         apnsID: nil
                     ),
