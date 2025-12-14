@@ -24,7 +24,7 @@ actor LiveActivityManager {
         }
 
         activeSessions[request.pushToken] = task
-        app.logger.info("Started Live Activity polling")
+        app.logger.info("Started Live Activity polling with username: \(request.username ?? "nil")")
     }
 
     func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
