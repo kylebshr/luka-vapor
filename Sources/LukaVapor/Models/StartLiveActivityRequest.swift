@@ -16,8 +16,10 @@ enum PushEnvironment: String, Codable {
 struct StartLiveActivityRequest: Codable {
     var pushToken: LiveActivityPushToken
     var environment: PushEnvironment
-    var accountID: UUID
-    var sessionID: UUID
+    var username: String?
+    var password: String?
+    var accountID: UUID?
+    var sessionID: UUID?
     var accountLocation: AccountLocation
     var duration: TimeInterval
 }

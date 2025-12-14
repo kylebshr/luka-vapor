@@ -2,40 +2,28 @@ import Vapor
 import Dexcom
 import APNS
 import APNSCore
+import VaporAPNS
 import Foundation
 
 actor LiveActivityManager {
     private var activeSessions: [LiveActivityPushToken: Task<Void, Never>] = [:]
 
     func startPolling(
-        sessionID: UUID,
-        accountID: UUID,
-        accountLocation: AccountLocation,
-        pushToken: LiveActivityPushToken,
-        environment: PushEnvironment,
-        duration: TimeInterval,
+        request: StartLiveActivityRequest,
         app: Application
     ) {
         // Cancel existing session if present
-        if let existingTask = activeSessions[pushToken] {
+        if let existingTask = activeSessions[request.pushToken] {
             existingTask.cancel()
-            app.logger.info("Cancelled existing session: \(sessionID) token: \(pushToken)")
+            app.logger.info("Cancelled session for existing token")
         }
 
         // Spawn background polling task
         let task = Task {
-            await self.pollForUpdates(
-                sessionID: sessionID,
-                accountID: accountID,
-                accountLocation: accountLocation,
-                pushToken: pushToken,
-                environment: environment,
-                duration: duration,
-                app: app
-            )
+            await self.pollForUpdates(request: request, app: app)
         }
 
-        activeSessions[pushToken] = task
+        activeSessions[request.pushToken] = task
         app.logger.info("Started Live Activity polling")
     }
 
@@ -51,12 +39,7 @@ actor LiveActivityManager {
     }
 
     private func pollForUpdates(
-        sessionID: UUID,
-        accountID: UUID,
-        accountLocation: AccountLocation,
-        pushToken: LiveActivityPushToken,
-        environment: PushEnvironment,
-        duration: TimeInterval,
+        request: StartLiveActivityRequest,
         app: Application
     ) async {
         var lastReadingDate: Date?
@@ -66,28 +49,28 @@ actor LiveActivityManager {
         let readingInterval: TimeInterval = 60 * 5 // 5 minutes between readings
 
         // Send push notification
-        let apnsClient = switch environment {
+        let apnsClient = switch request.environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
         }
 
         nonisolated(unsafe) let client = DexcomClient(
-            username: nil,
-            password: nil,
-            existingAccountID: accountID,
-            existingSessionID: sessionID,
-            accountLocation: accountLocation
+            username: request.username,
+            password: request.password,
+            existingAccountID: request.accountID,
+            existingSessionID: request.sessionID,
+            accountLocation: request.accountLocation
         )
 
         while !Task.isCancelled {
             do {
                 // Fetch latest readings
                 let readings = try await client.getGlucoseReadings(
-                    duration: .init(value: duration, unit: .seconds)
+                    duration: .init(value: request.duration, unit: .seconds)
                 ).sorted { $0.date < $1.date }
 
                 guard let latestReading = readings.last else {
-                    app.logger.warning("No readings available for session: \(sessionID) token: \(pushToken)")
+                    app.logger.warning("No readings available")
                     try await Task.sleep(for: .seconds(pollInterval))
                     pollInterval = min(pollInterval * 1.5, maxInterval)
                     continue
@@ -106,7 +89,7 @@ actor LiveActivityManager {
                     } else {
                         // Still within normal reading window, wait for next expected reading
                         let timeUntilNextReading = readingInterval - timeSinceLastReading
-                        app.logger.debug("Next reading expected in \(Int(timeUntilNextReading))s for session: \(sessionID) token: \(pushToken)")
+                        app.logger.debug("Next reading expected in \(Int(timeUntilNextReading))s, sleeping...")
                         try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval)))
                         pollInterval = minInterval // Reset backoff
                     }
@@ -117,7 +100,7 @@ actor LiveActivityManager {
                 lastReadingDate = latestReading.date
                 pollInterval = minInterval // Reset backoff
 
-                app.logger.debug("New reading for session \(sessionID): \(latestReading.value) at \(latestReading.date)")
+                app.logger.debug("New reading available, sending push")
 
                 // Build Live Activity state
                 let state = LiveActivityState(
@@ -135,59 +118,65 @@ actor LiveActivityManager {
                             event: .update,
                             timestamp: Int(Date.now.timeIntervalSince1970),
                             dismissalDate: .none,
-                            staleDate: Int(Date.now.addingTimeInterval(60 * 7).timeIntervalSince1970),
+                            staleDate: Int(Date.now.addingTimeInterval(60 * 10).timeIntervalSince1970),
                             apnsID: nil
                         ),
-                        deviceToken: pushToken.rawValue
+                        deviceToken: request.pushToken.rawValue
                     )
-                    app.logger.debug("Sent Live Activity update for session: \(sessionID) token: \(pushToken)")
+                    app.logger.debug("Sent Live Activity push")
                 } catch let error as APNSCore.APNSError {
-                    app.logger.error("APNS error for session \(sessionID): \(error)")
+                    app.logger.error("APNS error: \(error)")
                     // If token is invalid, stop polling
                     if let reason = error.reason {
                         // "ExpiredToken" is not yet supported by APNSWift
                         if reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
-                            app.logger.info("Live Activity ended because \(reason.reason), stopping polling")
+                            app.logger.error("Live Activity ended because \(reason.reason), stopping polling")
                             break
                         }
                     }
                 } catch {
-                    app.logger.error("Unexpected error sending push for session \(sessionID): \(error)")
+                    app.logger.error("Unexpected error sending push: \(error)")
                 }
             } catch is CancellationError {
-                app.logger.debug("Polling cancelled for session: \(sessionID) token: \(pushToken)")
+                app.logger.debug("Polling explicitly cancelled")
                 break
             } catch let error as DexcomClientError {
                 app.logger.error("Ending polling due to DexcomClientError: \(error)")
-
-                // The client tried to refresh the session, but we don't have a username or password.
-                let sessionExpired = error == .noUsernameOrPassword
-
-                _ = try? await apnsClient.sendLiveActivityNotification(
-                    .init(
-                        expiration: .none,
-                        priority: .immediately,
-                        appID: "com.kylebashour.Glimpse",
-                        contentState: LiveActivityState(c: nil, h: [], se: sessionExpired),
-                        event: .end,
-                        timestamp: Int(Date.now.timeIntervalSince1970),
-                        dismissalDate: .none,
-                        staleDate: nil,
-                        apnsID: nil
-                    ),
-                    deviceToken: pushToken.rawValue
-                )
-
+                await sendEndEvent(apnsClient: apnsClient, pushToken: request.pushToken)
                 break
             } catch {
-                app.logger.error("Error polling for session \(sessionID): \(error)")
-                // On error, use backoff before retrying
-                try? await Task.sleep(for: .seconds(pollInterval))
-                pollInterval = min(pollInterval * 1.5, maxInterval)
+                app.logger.error("Error polling for session: \(error)")
+                if pollInterval > maxInterval {
+                    app.logger.error("Done polling, ending activity")
+                    await sendEndEvent(apnsClient: apnsClient, pushToken: request.pushToken)
+                    break
+                } else {
+                    app.logger.error("Retrying in \(pollInterval)s")
+                    // On error, use backoff before retrying
+                    try? await Task.sleep(for: .seconds(pollInterval))
+                    pollInterval = min(pollInterval * 1.5, maxInterval)
+                }
             }
         }
 
-        self.cleanupSession(pushToken)
+        cleanupSession(request.pushToken)
+    }
+
+    private func sendEndEvent(apnsClient: APNSGenericClient, pushToken: LiveActivityPushToken) async {
+        _ = try? await apnsClient.sendLiveActivityNotification(
+            .init(
+                expiration: .none,
+                priority: .immediately,
+                appID: "com.kylebashour.Glimpse",
+                contentState: LiveActivityState(c: nil, h: [], se: true),
+                event: .end,
+                timestamp: Int(Date.now.timeIntervalSince1970),
+                dismissalDate: .none,
+                staleDate: nil,
+                apnsID: nil
+            ),
+            deviceToken: pushToken.rawValue
+        )
     }
 
     private func cleanupSession(_ pushToken: LiveActivityPushToken) {
