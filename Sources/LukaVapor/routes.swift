@@ -23,12 +23,7 @@ func routes(_ app: Application) throws {
 
         // Start background polling
         await req.application.liveActivityManager.startPolling(
-            sessionID: body.sessionID,
-            accountID: body.accountID,
-            accountLocation: body.accountLocation,
-            pushToken: body.pushToken,
-            environment: body.environment,
-            duration: body.duration,
+            request: body,
             app: req.application
         )
 
