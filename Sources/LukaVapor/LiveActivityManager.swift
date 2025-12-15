@@ -66,6 +66,7 @@ actor LiveActivityManager {
         while !Task.isCancelled {
             do {
                 // Fetch latest readings
+                app.logger.info("\(request.logID) Fetching latest readings")
                 let readings = try await client.getGlucoseReadings(
                     duration: .init(value: request.duration, unit: .seconds)
                 ).sorted { $0.date < $1.date }
