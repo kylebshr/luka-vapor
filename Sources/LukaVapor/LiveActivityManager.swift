@@ -24,7 +24,7 @@ actor LiveActivityManager {
         }
 
         activeSessions[request.pushToken] = task
-        app.logger.info("\(request.logID) Started Live Activity polling with username: \(request.username ?? "nil")")
+        app.logger.info("\(request.logID) Started Live Activity polling")
     }
 
     func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
@@ -84,14 +84,14 @@ actor LiveActivityManager {
 
                     if timeSinceLastReading > readingInterval {
                         // Reading is overdue, increase polling frequency with backoff
-                        app.logger.info("\(request.logID) Waiting for new reading (last: \(lastDate), current: \(latestReading.date)) - polling in \(Int(pollInterval))s")
+                        app.logger.info("\(request.logID) Waiting for new reading - polling in \(pollInterval)s")
                         try await Task.sleep(for: .seconds(pollInterval))
                         pollInterval = min(pollInterval * 1.5, maxInterval)
                     } else {
                         // Still within normal reading window, wait for next expected reading
                         let timeUntilNextReading = readingInterval - timeSinceLastReading
-                        app.logger.info("\(request.logID) Next reading expected in \(Int(timeUntilNextReading))s, sleeping...")
-                        try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval)))
+                        app.logger.info("\(request.logID) Next reading expected in \(timeUntilNextReading)s, sleeping...")
+                        try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval) + 2)) // extra 2s to give time for reading to upload
                         pollInterval = minInterval // Reset backoff
                     }
                     continue
