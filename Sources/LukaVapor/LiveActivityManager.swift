@@ -27,14 +27,14 @@ actor LiveActivityManager {
         app.logger.info("\(request.logID) Started Live Activity polling with username: \(request.username ?? "nil")")
     }
 
-    func stopPolling(request: StartLiveActivityRequest, app: Application) {
-        app.logger.info("\(request.logID) Ending Live Activity session explicitly")
+    func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
+        app.logger.info("Ending Live Activity session explicitly")
 
-        if let task = activeSessions.removeValue(forKey: request.pushToken) {
+        if let task = activeSessions.removeValue(forKey: pushToken) {
             task.cancel()
-            app.logger.debug("\(request.logID) Stopped polling for token: \(request.pushToken)")
+            app.logger.debug("Stopped polling for token: \(pushToken)")
         } else {
-            app.logger.debug("\(request.logID) Not polling for token: \(request.pushToken)")
+            app.logger.debug("Not polling for token: \(pushToken)")
         }
     }
 
