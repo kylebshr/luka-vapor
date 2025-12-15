@@ -44,7 +44,7 @@ actor LiveActivityManager {
     ) async {
         var lastReadingDate: Date?
 
-        let minInterval: TimeInterval = 2
+        let minInterval: TimeInterval = 5
         let maxInterval: TimeInterval = 60 // Cap at 60 seconds
         let readingInterval: TimeInterval = 60 * 5 // 5 minutes between readings
         var pollInterval: TimeInterval = minInterval
@@ -143,7 +143,7 @@ actor LiveActivityManager {
                 // Wait for next expected reading
                 let timeSinceReading = Date.now.timeIntervalSince(latestReading.date)
                 let timeUntilNextReading = readingInterval - timeSinceReading
-                try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval) + 5))
+                try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval) + 10))
             } catch is CancellationError {
                 app.logger.info("\(request.logID) Polling explicitly cancelled")
                 break
