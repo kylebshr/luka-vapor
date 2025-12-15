@@ -138,6 +138,11 @@ actor LiveActivityManager {
                 } catch {
                     app.logger.error("\(request.logID) Unexpected error sending push: \(error)")
                 }
+
+                // Wait for next expected reading
+                let timeSinceReading = Date.now.timeIntervalSince(latestReading.date)
+                let timeUntilNextReading = readingInterval - timeSinceReading
+                try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval) + 5))
             } catch is CancellationError {
                 app.logger.info("\(request.logID) Polling explicitly cancelled")
                 break
