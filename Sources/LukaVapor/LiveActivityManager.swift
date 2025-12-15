@@ -44,7 +44,7 @@ actor LiveActivityManager {
     ) async {
         var lastReadingDate: Date?
 
-        let minInterval: TimeInterval = 1
+        let minInterval: TimeInterval = 2
         let maxInterval: TimeInterval = 60 // Cap at 60 seconds
         let readingInterval: TimeInterval = 60 * 5 // 5 minutes between readings
         var pollInterval: TimeInterval = minInterval
@@ -91,7 +91,7 @@ actor LiveActivityManager {
                         // Still within normal reading window, wait for next expected reading
                         let timeUntilNextReading = readingInterval - timeSinceLastReading
                         app.logger.info("\(request.logID) Next reading expected in \(timeUntilNextReading)s, sleeping...")
-                        try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval) + 2)) // extra 2s to give time for reading to upload
+                        try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval) + 5)) // extra 5s to give time for reading to upload
                         pollInterval = minInterval // Reset backoff
                     }
                     continue
