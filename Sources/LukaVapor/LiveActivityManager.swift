@@ -43,10 +43,11 @@ actor LiveActivityManager {
         app: Application
     ) async {
         var lastReadingDate: Date?
-        var pollInterval: TimeInterval = 1 // Start at 5 seconds
+
         let minInterval: TimeInterval = 1
         let maxInterval: TimeInterval = 60 // Cap at 60 seconds
         let readingInterval: TimeInterval = 60 * 5 // 5 minutes between readings
+        var pollInterval: TimeInterval = minInterval
 
         // Send push notification
         let apnsClient = switch request.environment {
