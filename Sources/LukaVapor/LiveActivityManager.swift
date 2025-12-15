@@ -101,7 +101,7 @@ actor LiveActivityManager {
                 lastReadingDate = latestReading.date
                 pollInterval = minInterval // Reset backoff
 
-                app.logger.debug("New reading available, sending push")
+                app.logger.info("New reading available, sending push")
 
                 // Build Live Activity state
                 let state = LiveActivityState(
@@ -124,7 +124,7 @@ actor LiveActivityManager {
                         ),
                         deviceToken: request.pushToken.rawValue
                     )
-                    app.logger.debug("Sent Live Activity push")
+                    app.logger.info("Sent Live Activity push")
                 } catch let error as APNSCore.APNSError {
                     app.logger.error("APNS error: \(error)")
                     // If token is invalid, stop polling
@@ -148,14 +148,14 @@ actor LiveActivityManager {
             } catch {
                 app.logger.error("Error polling for session: \(error)")
                 if pollInterval > maxInterval {
-                    app.logger.error("Done polling, ending activity")
+                    app.logger.error("Done retrying due to errors, ending activity")
                     await sendEndEvent(apnsClient: apnsClient, pushToken: request.pushToken)
                     break
                 } else {
                     app.logger.error("Retrying in \(pollInterval)s")
-                    // On error, use backoff before retrying
+                    // On error, use a more aggressive exponential backoff
                     try? await Task.sleep(for: .seconds(pollInterval))
-                    pollInterval = min(pollInterval * 1.5, maxInterval)
+                    pollInterval = min(pollInterval * 3, maxInterval)
                 }
             }
         }
