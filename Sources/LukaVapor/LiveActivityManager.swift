@@ -15,7 +15,7 @@ actor LiveActivityManager {
         // Cancel existing session if present
         if let existingTask = activeSessions[request.pushToken] {
             existingTask.cancel()
-            app.logger.info("Cancelled session for existing token")
+            app.logger.info("\(request.logID) Cancelled session for existing token")
         }
 
         // Spawn background polling task
@@ -24,17 +24,17 @@ actor LiveActivityManager {
         }
 
         activeSessions[request.pushToken] = task
-        app.logger.info("Started Live Activity polling with username: \(request.username ?? "nil")")
+        app.logger.info("\(request.logID) Started Live Activity polling with username: \(request.username ?? "nil")")
     }
 
-    func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
-        app.logger.info("Ending Live Activity session explicitly")
+    func stopPolling(request: StartLiveActivityRequest, app: Application) {
+        app.logger.info("\(request.logID) Ending Live Activity session explicitly")
 
-        if let task = activeSessions.removeValue(forKey: pushToken) {
+        if let task = activeSessions.removeValue(forKey: request.pushToken) {
             task.cancel()
-            app.logger.debug("Stopped polling for token: \(pushToken)")
+            app.logger.debug("\(request.logID) Stopped polling for token: \(request.pushToken)")
         } else {
-            app.logger.debug("Not polling for token: \(pushToken)")
+            app.logger.debug("\(request.logID) Not polling for token: \(request.pushToken)")
         }
     }
 
@@ -71,7 +71,7 @@ actor LiveActivityManager {
                 ).sorted { $0.date < $1.date }
 
                 guard let latestReading = readings.last else {
-                    app.logger.warning("No readings available")
+                    app.logger.warning("\(request.logID) No readings available")
                     try await Task.sleep(for: .seconds(pollInterval))
                     pollInterval = min(pollInterval * 1.5, maxInterval)
                     continue
@@ -84,13 +84,13 @@ actor LiveActivityManager {
 
                     if timeSinceLastReading > readingInterval {
                         // Reading is overdue, increase polling frequency with backoff
-                        app.logger.debug("Waiting for new reading (last: \(lastDate), current: \(latestReading.date)) - polling in \(Int(pollInterval))s")
+                        app.logger.info("\(request.logID) Waiting for new reading (last: \(lastDate), current: \(latestReading.date)) - polling in \(Int(pollInterval))s")
                         try await Task.sleep(for: .seconds(pollInterval))
                         pollInterval = min(pollInterval * 1.5, maxInterval)
                     } else {
                         // Still within normal reading window, wait for next expected reading
                         let timeUntilNextReading = readingInterval - timeSinceLastReading
-                        app.logger.debug("Next reading expected in \(Int(timeUntilNextReading))s, sleeping...")
+                        app.logger.info("\(request.logID) Next reading expected in \(Int(timeUntilNextReading))s, sleeping...")
                         try await Task.sleep(for: .seconds(max(timeUntilNextReading, minInterval)))
                         pollInterval = minInterval // Reset backoff
                     }
@@ -101,7 +101,7 @@ actor LiveActivityManager {
                 lastReadingDate = latestReading.date
                 pollInterval = minInterval // Reset backoff
 
-                app.logger.info("New reading available, sending push")
+                app.logger.info("\(request.logID) New reading available, sending push")
 
                 // Build Live Activity state
                 let state = LiveActivityState(
@@ -124,35 +124,35 @@ actor LiveActivityManager {
                         ),
                         deviceToken: request.pushToken.rawValue
                     )
-                    app.logger.info("Sent Live Activity push")
+                    app.logger.info("\(request.logID) Sent Live Activity push")
                 } catch let error as APNSCore.APNSError {
-                    app.logger.error("APNS error: \(error)")
+                    app.logger.error("\(request.logID) APNS error: \(error)")
                     // If token is invalid, stop polling
                     if let reason = error.reason {
                         // "ExpiredToken" is not yet supported by APNSWift
                         if reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
-                            app.logger.error("Live Activity ended because \(reason.reason), stopping polling")
+                            app.logger.error("\(request.logID) Live Activity ended because \(reason.reason), stopping polling")
                             break
                         }
                     }
                 } catch {
-                    app.logger.error("Unexpected error sending push: \(error)")
+                    app.logger.error("\(request.logID) Unexpected error sending push: \(error)")
                 }
             } catch is CancellationError {
-                app.logger.debug("Polling explicitly cancelled")
+                app.logger.info("\(request.logID) Polling explicitly cancelled")
                 break
             } catch let error as DexcomClientError {
-                app.logger.error("Ending polling due to DexcomClientError: \(error)")
+                app.logger.error("\(request.logID) Ending polling due to DexcomClientError: \(error)")
                 await sendEndEvent(apnsClient: apnsClient, pushToken: request.pushToken)
                 break
             } catch {
-                app.logger.error("Error polling for session: \(error)")
+                app.logger.error("\(request.logID) Error polling for session: \(error)")
                 if pollInterval > maxInterval {
-                    app.logger.error("Done retrying due to errors, ending activity")
+                    app.logger.error("\(request.logID) Done retrying due to errors, ending activity")
                     await sendEndEvent(apnsClient: apnsClient, pushToken: request.pushToken)
                     break
                 } else {
-                    app.logger.error("Retrying in \(pollInterval)s")
+                    app.logger.error("\(request.logID) Retrying in \(pollInterval)s")
                     // On error, use a more aggressive exponential backoff
                     try? await Task.sleep(for: .seconds(pollInterval))
                     pollInterval = min(pollInterval * 3, maxInterval)
@@ -202,6 +202,30 @@ extension Application {
         }
         set {
             self.storage[LiveActivityManagerKey.self] = newValue
+        }
+    }
+}
+
+extension StartLiveActivityRequest {
+    var logID: String {
+        if let username {
+            let parts = username.split(separator: "@", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return String(username.prefix(4)) }  // not a valid email
+
+            let local = parts[0]
+            let domain = parts[1]
+
+            // Keep first character, replace the rest (if any) with dots
+            guard let firstChar = local.first else { return String(username.prefix(4)) }
+
+            let redactionCount = max(local.count - 1, 0)
+            let redaction = String(repeating: "•", count: redactionCount)
+
+            return "\(firstChar)\(redaction)@\(domain)"
+        } else if let accountID {
+            return String(accountID.uuidString.prefix(4))
+        } else {
+            return "n/a"
         }
     }
 }
