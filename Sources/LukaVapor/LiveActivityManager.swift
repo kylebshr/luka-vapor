@@ -173,14 +173,6 @@ actor LiveActivityManager {
                 }
             }
         }
-
-        stopPolling(
-            request: EndLiveActivityRequest(
-                pushToken: request.pushToken,
-                username: request.username
-            ),
-            app: app
-        )
     }
 
     private func sendEndEvent(apnsClient: APNSGenericClient, pushToken: LiveActivityPushToken) async {
