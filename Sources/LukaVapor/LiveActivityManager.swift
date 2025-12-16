@@ -37,12 +37,12 @@ actor LiveActivityManager {
 
         if let username = request.username, let task = activeSessions.removeValue(forKey: username) {
             task.cancel()
-            app.logger.debug("Stopped polling for username")
+            app.logger.info("Stopped polling for username")
         } else if let pushToken = request.pushToken, let task = activeSessions.removeValue(forKey: pushToken.rawValue) {
             task.cancel()
-            app.logger.debug("Stopped polling for token")
+            app.logger.info("Stopped polling for token")
         } else {
-            app.logger.debug("Wasn't polling")
+            app.logger.info("Wasn't polling")
         }
     }
 
