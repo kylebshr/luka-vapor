@@ -11,7 +11,7 @@ func routes(_ app: Application) throws {
         let body = try req.content.decode(EndLiveActivityRequest.self)
 
         await req.application.liveActivityManager.stopPolling(
-            pushToken: body.pushToken,
+            request: body,
             app: app
         )
 

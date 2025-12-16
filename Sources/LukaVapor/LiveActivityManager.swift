@@ -6,16 +6,21 @@ import VaporAPNS
 import Foundation
 
 actor LiveActivityManager {
-    private var activeSessions: [LiveActivityPushToken: Task<Void, Never>] = [:]
+    private var activeSessions: [String: Task<Void, Never>] = [:]
 
     func startPolling(
         request: StartLiveActivityRequest,
         app: Application
     ) {
         // Cancel existing session if present
-        if let existingTask = activeSessions[request.pushToken] {
+        if let existingTask = activeSessions[request.pushToken.rawValue] {
             existingTask.cancel()
             app.logger.info("\(request.logID) Cancelled session for existing token")
+        }
+
+        if let username = request.username, let existingTask = activeSessions[username] {
+            existingTask.cancel()
+            app.logger.info("\(request.logID) Cancelled session for existing username")
         }
 
         // Spawn background polling task
@@ -23,18 +28,21 @@ actor LiveActivityManager {
             await self.pollForUpdates(request: request, app: app)
         }
 
-        activeSessions[request.pushToken] = task
+        activeSessions[request.username ?? request.pushToken.rawValue] = task
         app.logger.info("\(request.logID) Started Live Activity polling")
     }
 
-    func stopPolling(pushToken: LiveActivityPushToken, app: Application) {
+    func stopPolling(request: EndLiveActivityRequest, app: Application) {
         app.logger.info("Ending Live Activity session explicitly")
 
-        if let task = activeSessions.removeValue(forKey: pushToken) {
+        if let username = request.username, let task = activeSessions.removeValue(forKey: username) {
             task.cancel()
-            app.logger.debug("Stopped polling for token: \(pushToken)")
+            app.logger.debug("Stopped polling for username")
+        } else if let pushToken = request.pushToken, let task = activeSessions.removeValue(forKey: pushToken.rawValue) {
+            task.cancel()
+            app.logger.debug("Stopped polling for token")
         } else {
-            app.logger.debug("Not polling for token: \(pushToken)")
+            app.logger.debug("Wasn't polling")
         }
     }
 
@@ -166,7 +174,13 @@ actor LiveActivityManager {
             }
         }
 
-        cleanupSession(request.pushToken)
+        stopPolling(
+            request: EndLiveActivityRequest(
+                pushToken: request.pushToken,
+                username: request.username
+            ),
+            app: app
+        )
     }
 
     private func sendEndEvent(apnsClient: APNSGenericClient, pushToken: LiveActivityPushToken) async {
@@ -184,10 +198,6 @@ actor LiveActivityManager {
             ),
             deviceToken: pushToken.rawValue
         )
-    }
-
-    private func cleanupSession(_ pushToken: LiveActivityPushToken) {
-        activeSessions.removeValue(forKey: pushToken)
     }
 }
 
