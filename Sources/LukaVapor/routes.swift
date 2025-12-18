@@ -24,7 +24,7 @@ func routes(_ app: Application) throws {
 
         // Delete the key - job will see it's gone and stop rescheduling
         _ = try await req.redis.delete(key).get()
-        req.logger.notice("Ended Live Activity session")
+        req.logger.notice("🛑 Ended Live Activity session")
 
         return .ok
     }
@@ -51,7 +51,7 @@ func routes(_ app: Application) throws {
         )
         try await req.queue.dispatch(LiveActivityJob.self, payload)
 
-        req.logger.notice("\(body.logID) Started Live Activity polling")
+        req.logger.notice("🆕 \(body.logID) Started Live Activity polling")
 
         return .ok
     }

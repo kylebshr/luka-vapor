@@ -62,13 +62,13 @@ struct LiveActivityJob: AsyncJob {
         // Check if this activity is still active (key exists)
         let isActive = try await app.redis.exists(Self.activeKey(for: payload)).get() > 0
         guard isActive else {
-            app.logger.notice("\(payload.logID) Live activity no longer active, stopping")
+            app.logger.notice("🛑 \(payload.logID) Live activity no longer active, stopping")
             return
         }
 
         // Check if max duration reached
         if Date.now.timeIntervalSince(payload.startDate) >= Self.maximumDuration {
-            app.logger.notice("\(payload.logID) Reached maximum duration, ending live activity")
+            app.logger.notice("🕔 \(payload.logID) Reached maximum duration, ending live activity")
             await sendEndEvent(app: app, payload: payload)
             _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
             return
@@ -96,13 +96,13 @@ struct LiveActivityJob: AsyncJob {
 
         do {
             // Fetch latest readings
-            app.logger.notice("\(payload.logID) Fetching latest readings")
+            app.logger.notice("☁️ \(payload.logID) Fetching latest readings")
             let readings = try await client.getGlucoseReadings(
                 duration: .init(value: payload.duration, unit: .seconds)
             ).sorted { $0.date < $1.date }
 
             guard let latestReading = readings.last else {
-                app.logger.warning("\(payload.logID) No readings available")
+                app.logger.warning("🚫 \(payload.logID) No readings available")
                 nextPollInterval = min(nextPollInterval * 1.5, Self.maxInterval)
                 try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: nextPollInterval, sessionCapture: sessionCapture)
                 return
@@ -115,14 +115,14 @@ struct LiveActivityJob: AsyncJob {
 
                 if timeSinceLastReading > Self.readingInterval {
                     // Reading is overdue, poll with backoff
-                    app.logger.notice("\(payload.logID) Waiting for new reading - polling in \(nextPollInterval)s")
+                    app.logger.notice("🔄 \(payload.logID) No new reading - polling in \(nextPollInterval)s")
                     nextPollInterval = min(nextPollInterval * 1.5, Self.maxInterval)
                     try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: nextPollInterval, sessionCapture: sessionCapture)
                 } else {
                     // Still within normal reading window, wait for next expected reading
                     let timeUntilNextReading = Self.readingInterval - timeSinceLastReading
                     let delay = max(timeUntilNextReading, Self.minInterval) + 5 // extra 5s buffer
-                    app.logger.notice("\(payload.logID) Next reading expected in \(timeUntilNextReading)s, sleeping...")
+                    app.logger.notice("😴 \(payload.logID) Next reading expected in \(timeUntilNextReading)s - sleeping...")
                     nextPollInterval = Self.minInterval // Reset backoff
                     try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: delay, sessionCapture: sessionCapture)
                 }
@@ -133,7 +133,7 @@ struct LiveActivityJob: AsyncJob {
             nextLastReadingDate = latestReading.date
             nextPollInterval = Self.minInterval // Reset backoff
 
-            app.logger.notice("\(payload.logID) New reading available, sending push")
+            app.logger.notice("✅ \(payload.logID) New reading available - sending push")
 
             // Build Live Activity state
             let state = LiveActivityState(
@@ -157,7 +157,7 @@ struct LiveActivityJob: AsyncJob {
                     ),
                     deviceToken: payload.pushToken.rawValue
                 )
-                app.logger.notice("\(payload.logID) Sent Live Activity push")
+                app.logger.notice("🔔 \(payload.logID) Sent Live Activity push to \(payload.pushToken.rawValue.prefix(8))")
             } catch let error as APNSCore.APNSError {
                 app.logger.error("\(payload.logID) APNS error: \(error)")
                 // If token is invalid, stop polling
@@ -263,7 +263,7 @@ extension LiveActivityJob.LiveActivityJobPayload {
 
             return "\(firstChar)\(redaction)@\(domain)"
         } else if let accountID {
-            return String(accountID.uuidString.prefix(4))
+            return String(accountID.uuidString.prefix(8))
         } else {
             return "n/a"
         }
