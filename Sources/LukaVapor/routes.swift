@@ -19,12 +19,13 @@ func routes(_ app: Application) throws {
         } else if let pushToken = body.pushToken {
             key = RedisKey("live-activity:\(pushToken.rawValue)")
         } else {
+            req.logger.error("Must provide username or pushToken")
             throw Abort(.badRequest, reason: "Must provide username or pushToken")
         }
 
         // Delete the key - job will see it's gone and stop rescheduling
         _ = try await req.redis.delete(key).get()
-        req.logger.notice("🛑 Ended Live Activity session")
+        req.logger.notice("🛑 Ended Live Activity session for \(key.rawValue.prefix(1))")
 
         return .ok
     }
