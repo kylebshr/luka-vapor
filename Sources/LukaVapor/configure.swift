@@ -19,7 +19,6 @@ public func configure(_ app: Application) async throws {
     try app.queues.use(.redis(url: redisURL))
 
     // Register jobs
-    app.queues.add(PrintTestJob())
     app.queues.add(LiveActivityJob())
 
     // Start queue worker in-process
