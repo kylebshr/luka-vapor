@@ -13,6 +13,8 @@ public func configure(_ app: Application) async throws {
        let keyID = Environment.get("PUSH_NOTIFICATION_ID"),
        let teamID = Environment.get("TEAM_IDENTIFIER") {
 
+        app.logger.info("Setting up APNS")
+
         let apnsdev = APNSClientConfiguration(
             authenticationMethod: .jwt(
                 privateKey: try .loadFrom(string: pemString),
