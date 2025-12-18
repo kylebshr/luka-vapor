@@ -49,7 +49,7 @@ func routes(_ app: Application) throws {
             lastReadingDate: nil,
             pollInterval: 5
         )
-        try await req.queue.dispatch(LiveActivityJob.self, payload)
+        try await req.queue.dispatch(LiveActivityJob.self, payload, maxRetryCount: 3)
 
         req.logger.notice("🆕 \(body.logID) Started Live Activity polling")
 
