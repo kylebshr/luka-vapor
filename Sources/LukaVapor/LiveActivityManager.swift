@@ -51,7 +51,10 @@ actor LiveActivityManager {
         app: Application
     ) async {
         var lastReadingDate: Date?
+        let startDate = Date.now
 
+        // Maximum duration is 8 hours, give ourselves some breathing room
+        let maximumLiveActivityDuration: TimeInterval = 60 * 60 * 7.5
         let minInterval: TimeInterval = 5
         let maxInterval: TimeInterval = 60 // Cap at 60 seconds
         let readingInterval: TimeInterval = 60 * 5 // 5 minutes between readings
@@ -72,6 +75,12 @@ actor LiveActivityManager {
         )
 
         while !Task.isCancelled {
+            if Date.now.timeIntervalSince(startDate) >= maximumLiveActivityDuration {
+                app.logger.info("\(request.logID) Reached maximum duration, ending live activity")
+                await sendEndEvent(apnsClient: apnsClient, pushToken: request.pushToken)
+                break
+            }
+
             do {
                 // Fetch latest readings
                 app.logger.info("\(request.logID) Fetching latest readings")
@@ -119,16 +128,17 @@ actor LiveActivityManager {
                 )
 
                 do {
+                    let staleDate = Int(Date.now.addingTimeInterval(60 * 10).timeIntervalSince1970)
                     try await apnsClient.sendLiveActivityNotification(
                         .init(
-                            expiration: .none,
+                            expiration: .timeIntervalSince1970InSeconds(staleDate),
                             priority: .immediately,
                             appID: "com.kylebashour.Glimpse",
                             contentState: state,
                             event: .update,
                             timestamp: Int(Date.now.timeIntervalSince1970),
                             dismissalDate: .none,
-                            staleDate: Int(Date.now.addingTimeInterval(60 * 10).timeIntervalSince1970),
+                            staleDate: staleDate,
                             apnsID: nil
                         ),
                         deviceToken: request.pushToken.rawValue
