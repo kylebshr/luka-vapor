@@ -14,6 +14,8 @@ let package = Package(
         .package(url: "https://github.com/swift-server-community/APNSwift", branch: "main"),
         .package(url: "https://github.com/kylebshr/dexcom-swift", branch: "main"),
         .package(url: "https://github.com/vapor/apns", from: "5.0.0"),
+        .package(url: "https://github.com/vapor/redis.git", from: "4.14.0"),
+        .package(url: "https://github.com/vapor/queues-redis-driver.git", from: "1.1.2"),
     ],
     targets: [
         .executableTarget(
@@ -25,6 +27,8 @@ let package = Package(
                 .product(name: "APNS", package: "APNSwift"),
                 .product(name: "Dexcom", package: "dexcom-swift"),
                 .product(name: "VaporAPNS", package: "apns"),
+                .product(name: "Redis", package: "redis"),
+                .product(name: "QueuesRedisDriver", package: "queues-redis-driver"),
             ],
             swiftSettings: swiftSettings
         ),

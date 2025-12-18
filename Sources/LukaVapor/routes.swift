@@ -1,6 +1,8 @@
 import Vapor
 import Dexcom
 import APNS
+import Queues
+import Redis
 
 func routes(_ app: Application) throws {
     app.get { req async in
@@ -27,6 +29,21 @@ func routes(_ app: Application) throws {
             app: req.application
         )
 
+        return .ok
+    }
+
+    app.get("start-test-job") { req async throws -> Response in
+        let id = UUID()
+        try await req.redis.set(PrintTestJob.runningKey(for: id), to: 1).get()
+        try await req.queue.dispatch(PrintTestJob.self, .init(id: id))
+        return Response(status: .ok, body: .init(string: id.uuidString))
+    }
+
+    app.get("stop-test-job", ":id") { req async throws -> HTTPStatus in
+        guard let id = req.parameters.get("id", as: UUID.self) else {
+            throw Abort(.badRequest)
+        }
+        try await req.redis.set(PrintTestJob.runningKey(for: id), to: 0).get()
         return .ok
     }
 }

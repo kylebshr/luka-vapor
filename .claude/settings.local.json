@@ -3,7 +3,13 @@
     "allow": [
       "Bash(curl:*)",
       "Bash(chmod:*)",
-      "Bash(source ~/.zshrc)"
+      "Bash(source ~/.zshrc)",
+      "Bash(redis-server:*)",
+      "Bash(brew install:*)",
+      "Bash(brew services start:*)",
+      "Bash(redis-cli:*)",
+      "Bash(swift package resolve:*)",
+      "Bash(swift run:*)"
     ],
     "deny": [],
     "ask": []

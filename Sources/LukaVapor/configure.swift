@@ -2,11 +2,26 @@ import Vapor
 import APNS
 import APNSCore
 import VaporAPNS
+import Redis
+import Queues
+import QueuesRedisDriver
 
 // configures your application
 public func configure(_ app: Application) async throws {
     // uncomment to serve files from /Public folder
     app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
+
+    // Configure Redis
+    app.redis.configuration = try RedisConfiguration(hostname: "localhost")
+
+    // Configure Queues with Redis
+    try app.queues.use(.redis(url: "redis://localhost:6379"))
+
+    // Register jobs
+    app.queues.add(PrintTestJob())
+
+    // Start queue worker in-process
+    try app.queues.startInProcessJobs()
 
     // Configure APNS
     if let pemString = Environment.get("PUSH_NOTIFICATION_PEM"),
