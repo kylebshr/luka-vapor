@@ -24,8 +24,8 @@ func routes(_ app: Application) throws {
         }
 
         // Delete the key - job will see it's gone and stop rescheduling
-        _ = try await req.redis.delete(key).get()
-        req.logger.notice("🛑 Ended Live Activity session for \(key.rawValue.prefix(1))")
+        let count = try await req.redis.delete(key).get()
+        req.logger.notice("🛑 Ended Live Activity \(count) session(s) for \(key.rawValue.prefix(1))")
 
         return .ok
     }
