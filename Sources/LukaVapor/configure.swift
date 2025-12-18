@@ -18,12 +18,6 @@ public func configure(_ app: Application) async throws {
     // Configure Queues with Redis
     try app.queues.use(.redis(url: redisURL))
 
-    // Register jobs
-    app.queues.add(LiveActivityJob())
-
-    // Start queue worker in-process
-    try app.queues.startInProcessJobs()
-
     // Configure APNS
     if let pemString = Environment.get("PUSH_NOTIFICATION_PEM"),
        let keyID = Environment.get("PUSH_NOTIFICATION_ID"),
@@ -68,4 +62,10 @@ public func configure(_ app: Application) async throws {
 
     // register routes
     try routes(app)
+
+    // Register jobs
+    app.queues.add(LiveActivityJob())
+
+    // Start queue worker in-process
+    try app.queues.startInProcessJobs()
 }
