@@ -12,10 +12,19 @@ func routes(_ app: Application) throws {
     app.post("end-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivityRequest.self)
 
-        await req.application.liveActivityManager.stopPolling(
-            request: body,
-            app: app
-        )
+        // Build the key from the request
+        let key: RedisKey
+        if let username = body.username {
+            key = RedisKey("live-activity:\(username)")
+        } else if let pushToken = body.pushToken {
+            key = RedisKey("live-activity:\(pushToken.rawValue)")
+        } else {
+            throw Abort(.badRequest, reason: "Must provide username or pushToken")
+        }
+
+        // Delete the key - job will see it's gone and stop rescheduling
+        _ = try await req.redis.delete(key).get()
+        req.logger.info("Ended Live Activity session")
 
         return .ok
     }
@@ -23,11 +32,26 @@ func routes(_ app: Application) throws {
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        // Start background polling
-        await req.application.liveActivityManager.startPolling(
-            request: body,
-            app: req.application
+        // Set flag to active
+        try await req.redis.set(LiveActivityJob.activeKey(for: body), to: 1).get()
+
+        // Dispatch the job with initial payload
+        let payload = LiveActivityJob.LiveActivityJobPayload(
+            pushToken: body.pushToken,
+            environment: body.environment,
+            username: body.username,
+            password: body.password,
+            accountID: body.accountID,
+            sessionID: body.sessionID,
+            accountLocation: body.accountLocation,
+            duration: body.duration,
+            startDate: Date.now,
+            lastReadingDate: nil,
+            pollInterval: 5
         )
+        try await req.queue.dispatch(LiveActivityJob.self, payload)
+
+        req.logger.info("\(body.logID) Started Live Activity polling")
 
         return .ok
     }

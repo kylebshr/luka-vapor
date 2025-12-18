@@ -7,6 +7,6 @@
 
 import Foundation
 
-struct LiveActivityPushToken: RawRepresentable, Codable, Hashable {
+struct LiveActivityPushToken: RawRepresentable, Codable, Hashable, Sendable {
     let rawValue: String
 }

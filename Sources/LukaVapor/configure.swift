@@ -19,6 +19,7 @@ public func configure(_ app: Application) async throws {
 
     // Register jobs
     app.queues.add(PrintTestJob())
+    app.queues.add(LiveActivityJob())
 
     // Start queue worker in-process
     try app.queues.startInProcessJobs()
