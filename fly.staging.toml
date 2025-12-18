@@ -17,10 +17,9 @@ primary_region = 'sjc'
   processes = ['app']
 
 [env]
-  LOG_LEVEL = 'info'
+  LOG_LEVEL = 'notice'
 
 [[vm]]
-  memory = '1gb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 1024

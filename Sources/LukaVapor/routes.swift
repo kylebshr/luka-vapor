@@ -24,7 +24,7 @@ func routes(_ app: Application) throws {
 
         // Delete the key - job will see it's gone and stop rescheduling
         _ = try await req.redis.delete(key).get()
-        req.logger.info("Ended Live Activity session")
+        req.logger.notice("Ended Live Activity session")
 
         return .ok
     }
@@ -51,23 +51,8 @@ func routes(_ app: Application) throws {
         )
         try await req.queue.dispatch(LiveActivityJob.self, payload)
 
-        req.logger.info("\(body.logID) Started Live Activity polling")
+        req.logger.notice("\(body.logID) Started Live Activity polling")
 
-        return .ok
-    }
-
-    app.get("start-test-job") { req async throws -> Response in
-        let id = UUID()
-        try await req.redis.set(PrintTestJob.runningKey(for: id), to: 1).get()
-        try await req.queue.dispatch(PrintTestJob.self, .init(id: id))
-        return Response(status: .ok, body: .init(string: id.uuidString))
-    }
-
-    app.get("stop-test-job", ":id") { req async throws -> HTTPStatus in
-        guard let id = req.parameters.get("id", as: UUID.self) else {
-            throw Abort(.badRequest)
-        }
-        try await req.redis.set(PrintTestJob.runningKey(for: id), to: 0).get()
         return .ok
     }
 }
