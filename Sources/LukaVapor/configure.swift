@@ -11,11 +11,12 @@ public func configure(_ app: Application) async throws {
     // uncomment to serve files from /Public folder
     app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
 
-    // Configure Redis
-    app.redis.configuration = try RedisConfiguration(hostname: "localhost")
+    // Configure Redis (use REDIS_URL env var on Fly, localhost for local dev)
+    let redisURL = Environment.get("REDIS_URL") ?? "redis://localhost:6379"
+    app.redis.configuration = try RedisConfiguration(url: redisURL)
 
     // Configure Queues with Redis
-    try app.queues.use(.redis(url: "redis://localhost:6379"))
+    try app.queues.use(.redis(url: redisURL))
 
     // Register jobs
     app.queues.add(PrintTestJob())
