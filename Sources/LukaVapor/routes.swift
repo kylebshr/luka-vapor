@@ -45,7 +45,7 @@ func routes(_ app: Application) throws {
             accountID: body.accountID,
             sessionID: body.sessionID,
             accountLocation: body.accountLocation,
-            duration: body.duration * 1.1, // Add 10% to extend chart into the past
+            duration: body.duration,
             startDate: Date.now,
             lastReadingDate: nil,
             pollInterval: 5
