@@ -11,7 +11,12 @@
       "Bash(swift package resolve:*)",
       "Bash(swift run:*)",
       "Bash(brew services:*)",
-      "Bash(fly logs:*)"
+      "Bash(fly logs:*)",
+      "Bash(swift build:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": []
