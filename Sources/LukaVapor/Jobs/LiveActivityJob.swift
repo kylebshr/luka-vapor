@@ -35,6 +35,7 @@ struct LiveActivityJob: AsyncJob {
         let duration: TimeInterval
 
         // Job state
+        let jobID: UUID  // Unique ID to prevent duplicate jobs
         let startDate: Date
         let lastReadingDate: Date?
         let pollInterval: TimeInterval
@@ -59,10 +60,11 @@ struct LiveActivityJob: AsyncJob {
     func dequeue(_ context: QueueContext, _ payload: LiveActivityJobPayload) async throws {
         let app = context.application
 
-        // Check if this activity is still active (key exists)
-        let isActive = try await app.redis.exists(Self.activeKey(for: payload)).get() > 0
-        guard isActive else {
-            app.logger.notice("🛑 \(payload.logID) Live activity no longer active, stopping")
+        // Check if this job's ID matches the current active job ID
+        // This prevents duplicate jobs when a new activity starts before the old one's jobs finish
+        let currentJobID: String? = try await app.redis.get(Self.activeKey(for: payload), as: String.self).get()
+        guard currentJobID == payload.jobID.uuidString else {
+            app.logger.notice("🛑 \(payload.logID) Job ID mismatch (stale job), stopping")
             return
         }
 
@@ -213,6 +215,7 @@ struct LiveActivityJob: AsyncJob {
             sessionID: sessionCapture.sessionID ?? payload.sessionID,
             accountLocation: payload.accountLocation,
             duration: payload.duration,
+            jobID: payload.jobID,
             startDate: payload.startDate,
             lastReadingDate: lastReadingDate,
             pollInterval: pollInterval

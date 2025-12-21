@@ -33,8 +33,11 @@ func routes(_ app: Application) throws {
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        // Set flag to active
-        try await req.redis.set(LiveActivityJob.activeKey(for: body), to: 1).get()
+        // Generate unique job ID - any old jobs with different IDs will stop themselves
+        let jobID = UUID()
+
+        // Store the job ID (replaces any previous ID, invalidating old jobs)
+        try await req.redis.set(LiveActivityJob.activeKey(for: body), to: jobID.uuidString).get()
 
         // Dispatch the job with initial payload
         let payload = LiveActivityJob.LiveActivityJobPayload(
@@ -46,6 +49,7 @@ func routes(_ app: Application) throws {
             sessionID: body.sessionID,
             accountLocation: body.accountLocation,
             duration: body.duration,
+            jobID: jobID,
             startDate: Date.now,
             lastReadingDate: nil,
             pollInterval: 5
