@@ -30,6 +30,17 @@ func routes(_ app: Application) throws {
         return .ok
     }
 
+    app.post("register-widget-token") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(RegisterWidgetTokenRequest.self)
+        let key = WidgetUpdateJob.redisKey(for: body.environment)
+
+        // Add token to the set (duplicates are automatically ignored)
+        _ = try await req.redis.sadd(body.pushToken.rawValue, to: key).get()
+        req.logger.notice("Registered widget token \(body.pushToken.rawValue.prefix(8))... for \(body.environment)")
+
+        return .ok
+    }
+
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 

@@ -66,6 +66,23 @@ public func configure(_ app: Application) async throws {
     // Register jobs
     app.queues.add(LiveActivityJob())
 
+    // Schedule widget update job to run every 15 minutes
+    app.queues.schedule(WidgetUpdateJob())
+        .hourly()
+        .at(0)
+    app.queues.schedule(WidgetUpdateJob())
+        .hourly()
+        .at(15)
+    app.queues.schedule(WidgetUpdateJob())
+        .hourly()
+        .at(30)
+    app.queues.schedule(WidgetUpdateJob())
+        .hourly()
+        .at(45)
+
     // Start queue worker in-process
     try app.queues.startInProcessJobs()
+
+    // Start scheduled jobs
+    try app.queues.startScheduledJobs()
 }
