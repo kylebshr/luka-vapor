@@ -33,12 +33,17 @@ struct LiveActivityJob: AsyncJob {
         let sessionID: UUID?
         let accountLocation: AccountLocation
         let duration: TimeInterval
+        let preferences: LiveActivityPreferences?
 
         // Job state
         let jobID: UUID  // Unique ID to prevent duplicate jobs
         let startDate: Date
-        let lastReadingDate: Date?
+        let lastReading: GlucoseReading?
         let pollInterval: TimeInterval
+
+        var lastReadingDate: Date? {
+            lastReading?.date
+        }
     }
 
     // Constants
@@ -94,7 +99,7 @@ struct LiveActivityJob: AsyncJob {
         client.delegate = sessionCapture
 
         var nextPollInterval = payload.pollInterval
-        var nextLastReadingDate = payload.lastReadingDate
+        var nextLastReading = payload.lastReading
 
         do {
             // Fetch latest readings
@@ -106,7 +111,14 @@ struct LiveActivityJob: AsyncJob {
             guard let latestReading = readings.last else {
                 app.logger.warning("🚫 \(payload.logID) No readings available")
                 nextPollInterval = min(nextPollInterval * 1.5, Self.maxInterval)
-                try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: nextPollInterval, sessionCapture: sessionCapture)
+                try await reschedule(
+                    context: context,
+                    payload: payload,
+                    pollInterval: nextPollInterval,
+                    lastReading: nextLastReading,
+                    delay: nextPollInterval,
+                    sessionCapture: sessionCapture
+                )
                 return
             }
 
@@ -117,22 +129,36 @@ struct LiveActivityJob: AsyncJob {
 
                 if timeSinceLastReading > Self.readingInterval {
                     // Reading is overdue, poll with backoff
-                    app.logger.notice("🔄 \(payload.logID) No new reading - polling in \(nextPollInterval)s")
+                    app.logger.notice("😴 \(payload.logID) No new reading - polling in \(nextPollInterval)s")
                     nextPollInterval = min(nextPollInterval * 1.5, Self.maxInterval)
-                    try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: nextPollInterval, sessionCapture: sessionCapture)
+                    try await reschedule(
+                        context: context,
+                        payload: payload,
+                        pollInterval: nextPollInterval,
+                        lastReading: nextLastReading,
+                        delay: nextPollInterval,
+                        sessionCapture: sessionCapture
+                    )
                 } else {
                     // Still within normal reading window, wait for next expected reading
                     let timeUntilNextReading = Self.readingInterval - timeSinceLastReading
                     let delay = max(timeUntilNextReading, Self.minInterval) + 5 // extra 5s buffer
                     app.logger.notice("😴 \(payload.logID) Next reading expected in \(timeUntilNextReading)s - sleeping...")
                     nextPollInterval = Self.minInterval // Reset backoff
-                    try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: delay, sessionCapture: sessionCapture)
+                    try await reschedule(
+                        context: context,
+                        payload: payload,
+                        pollInterval: nextPollInterval,
+                        lastReading: nextLastReading,
+                        delay: delay,
+                        sessionCapture: sessionCapture
+                    )
                 }
                 return
             }
 
             // New reading available!
-            nextLastReadingDate = latestReading.date
+            nextLastReading = latestReading
             nextPollInterval = Self.minInterval // Reset backoff
 
             app.logger.notice("✅ \(payload.logID) New reading available - sending push")
@@ -152,6 +178,12 @@ struct LiveActivityJob: AsyncJob {
                         appID: "com.kylebashour.Glimpse",
                         contentState: state,
                         event: .update,
+                        alert: alert(
+                            context,
+                            for: latestReading,
+                            lastReading: payload.lastReading,
+                            preferences: payload.preferences
+                        ),
                         timestamp: Int(Date.now.timeIntervalSince1970),
                         dismissalDate: .none,
                         staleDate: staleDate,
@@ -159,7 +191,7 @@ struct LiveActivityJob: AsyncJob {
                     ),
                     deviceToken: payload.pushToken.rawValue
                 )
-                app.logger.notice("🔔 \(payload.logID) Sent Live Activity push to \(payload.pushToken.rawValue.prefix(8))")
+                app.logger.notice("🚚 \(payload.logID) Sent Live Activity push to \(payload.pushToken.rawValue.prefix(8))")
             } catch let error as APNSCore.APNSError {
                 app.logger.error("\(payload.logID) APNS error: \(error)")
                 // If token is invalid, stop polling
@@ -178,7 +210,14 @@ struct LiveActivityJob: AsyncJob {
             let timeSinceReading = Date.now.timeIntervalSince(latestReading.date)
             let timeUntilNextReading = Self.readingInterval - timeSinceReading
             let delay = max(timeUntilNextReading, Self.minInterval) + 10
-            try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: delay, sessionCapture: sessionCapture)
+            try await reschedule(
+                context: context,
+                payload: payload,
+                pollInterval: nextPollInterval,
+                lastReading: nextLastReading,
+                delay: delay,
+                sessionCapture: sessionCapture
+            )
 
         } catch let error as DexcomClientError {
             app.logger.error("\(payload.logID) Ending polling due to DexcomClientError: \(error)")
@@ -193,16 +232,61 @@ struct LiveActivityJob: AsyncJob {
             } else {
                 app.logger.error("\(payload.logID) Retrying in \(nextPollInterval)s")
                 nextPollInterval = min(nextPollInterval * 3, Self.maxInterval)
-                try await reschedule(context: context, payload: payload, pollInterval: nextPollInterval, lastReadingDate: nextLastReadingDate, delay: nextPollInterval, sessionCapture: sessionCapture)
+                try await reschedule(
+                    context: context,
+                    payload: payload,
+                    pollInterval: nextPollInterval,
+                    lastReading: nextLastReading,
+                    delay: nextPollInterval,
+                    sessionCapture: sessionCapture
+                )
             }
         }
+    }
+
+    private func alert(
+        _ context: QueueContext,
+        for reading: GlucoseReading,
+        lastReading: GlucoseReading?,
+        preferences: LiveActivityPreferences?
+    ) -> APNSAlertNotificationContent? {
+        guard let lastReading, let preferences else {
+            return nil
+        }
+
+        let (targetRange, unit) = (preferences.targetRange, preferences.unit)
+
+        guard targetRange.contains(reading.value) != targetRange.contains(lastReading.value) else {
+            return nil
+        }
+
+        let formattedValue = reading.value.formatted(.glucose(unit))
+        let formattedLastValue = lastReading.value.formatted(.glucose(unit))
+
+        let (title, body) = if reading.value > targetRange.upperBound {
+            ("High Glucose", "Now \(formattedValue) and \(reading.trend.adjective ?? "rising"), was \(formattedLastValue).")
+        } else if reading.value < targetRange.lowerBound {
+            ("Low Glucose", "Now \(formattedValue) and \(reading.trend.adjective ?? "falling"), was \(formattedLastValue).")
+        } else {
+            ("Back in Range", "Now \(formattedValue) and \(reading.trend.adjective ?? "steady"), was \(formattedLastValue).")
+        }
+
+        context.logger.notice("🔔 Sending an alert in the payload")
+
+        return APNSAlertNotificationContent(
+            title: .raw(title),
+            subtitle: nil,
+            body: .raw(body),
+            launchImage: nil,
+            sound: nil
+        )
     }
 
     private func reschedule(
         context: QueueContext,
         payload: LiveActivityJobPayload,
         pollInterval: TimeInterval,
-        lastReadingDate: Date?,
+        lastReading: GlucoseReading?,
         delay: TimeInterval,
         sessionCapture: SessionCapture
     ) async throws {
@@ -215,9 +299,10 @@ struct LiveActivityJob: AsyncJob {
             sessionID: sessionCapture.sessionID ?? payload.sessionID,
             accountLocation: payload.accountLocation,
             duration: payload.duration,
+            preferences: payload.preferences,
             jobID: payload.jobID,
             startDate: payload.startDate,
-            lastReadingDate: lastReadingDate,
+            lastReading: lastReading,
             pollInterval: pollInterval
         )
         try await context.queue.dispatch(

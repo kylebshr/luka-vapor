@@ -49,9 +49,10 @@ func routes(_ app: Application) throws {
             sessionID: body.sessionID,
             accountLocation: body.accountLocation,
             duration: body.duration,
+            preferences: body.preferences,
             jobID: jobID,
             startDate: Date.now,
-            lastReadingDate: nil,
+            lastReading: nil,
             pollInterval: 5
         )
         try await req.queue.dispatch(LiveActivityJob.self, payload, maxRetryCount: 3)

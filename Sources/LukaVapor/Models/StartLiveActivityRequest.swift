@@ -13,6 +13,11 @@ enum PushEnvironment: String, Codable, Sendable {
     case production
 }
 
+struct LiveActivityPreferences: Codable {
+    var targetRange: ClosedRange<Int>
+    var unit: GlucoseFormatter.Unit
+}
+
 struct StartLiveActivityRequest: Codable, Sendable {
     var pushToken: LiveActivityPushToken
     var environment: PushEnvironment
@@ -22,6 +27,7 @@ struct StartLiveActivityRequest: Codable, Sendable {
     var sessionID: UUID?
     var accountLocation: AccountLocation
     var duration: TimeInterval
+    var preferences: LiveActivityPreferences?
 }
 
 extension StartLiveActivityRequest {
