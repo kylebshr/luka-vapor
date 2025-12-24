@@ -255,8 +255,10 @@ struct LiveActivityJob: AsyncJob {
         }
 
         let (targetRange, unit) = (preferences.targetRange, preferences.unit)
+        let isRapidTrend = reading.trend == .doubleDown || reading.trend == .doubleUp
+        let didEnterOrLeaveTargetRange = targetRange.contains(reading.value) != targetRange.contains(lastReading.value)
 
-        guard targetRange.contains(reading.value) != targetRange.contains(lastReading.value) else {
+        guard isRapidTrend || didEnterOrLeaveTargetRange else {
             return nil
         }
 
