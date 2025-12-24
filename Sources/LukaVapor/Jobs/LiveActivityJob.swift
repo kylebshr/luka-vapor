@@ -142,7 +142,7 @@ struct LiveActivityJob: AsyncJob {
                 } else {
                     // Still within normal reading window, wait for next expected reading
                     let timeUntilNextReading = Self.readingInterval - timeSinceLastReading
-                    let delay = max(timeUntilNextReading, Self.minInterval) + 5 // extra 5s buffer
+                    let delay = max(timeUntilNextReading + 2, Self.minInterval) // extra 2s buffer
                     app.logger.notice("😴 \(payload.logID) Next reading expected in \(timeUntilNextReading)s - sleeping...")
                     nextPollInterval = Self.minInterval // Reset backoff
                     try await reschedule(
@@ -209,7 +209,7 @@ struct LiveActivityJob: AsyncJob {
             // Wait for next expected reading
             let timeSinceReading = Date.now.timeIntervalSince(latestReading.date)
             let timeUntilNextReading = Self.readingInterval - timeSinceReading
-            let delay = max(timeUntilNextReading, Self.minInterval) + 10
+            let delay = max(timeUntilNextReading + 2, Self.minInterval)
             try await reschedule(
                 context: context,
                 payload: payload,
