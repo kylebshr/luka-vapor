@@ -66,9 +66,9 @@ struct LiveActivityJob: AsyncJob {
     func dequeue(_ context: QueueContext, _ payload: LiveActivityJobPayload) async throws {
         let app = context.application
 
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        app.logger.notice("🔔 \(payload.logID) Job dequeued at \(formatter.string(from: Date()))")
+        let now = Date()
+        let timestamp = now.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
+        app.logger.notice("🔔 \(payload.logID) Job dequeued at \(timestamp)")
 
         // Check if this job's ID matches the current active job ID
         // This prevents duplicate jobs when a new activity starts before the old one's jobs finish
@@ -328,8 +328,7 @@ struct LiveActivityJob: AsyncJob {
         )
 
         let scheduledTime = Date().addingTimeInterval(delay)
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let timestamp = scheduledTime.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
 
         try await context.queue.dispatch(
             LiveActivityJob.self,
@@ -338,7 +337,7 @@ struct LiveActivityJob: AsyncJob {
             delayUntil: scheduledTime
         )
 
-        context.application.logger.notice("😴 \(payload.logID) Scheduled for \(formatter.string(from: scheduledTime)) (in \(delay)s)")
+        context.application.logger.notice("😴 \(payload.logID) Scheduled for \(timestamp) (in \(delay)s)")
     }
 
     private func sendEndEvent(app: Application, payload: LiveActivityJobPayload) async {
