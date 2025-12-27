@@ -1,3 +1,4 @@
+import FoundationNetworking
 import Vapor
 import Queues
 import Redis
