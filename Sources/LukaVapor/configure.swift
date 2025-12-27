@@ -18,8 +18,8 @@ public func configure(_ app: Application) async throws {
     // Configure Queues with Redis
     try app.queues.use(.redis(url: redisURL))
 
-    // Set aggressive polling for low-latency job execution (100ms)
-    app.queues.configuration.refreshInterval = .milliseconds(100)
+    // Set aggressive polling for low-latency job execution
+    app.queues.configuration.refreshInterval = .milliseconds(500)
 
     // Configure APNS
     if let pemString = Environment.get("PUSH_NOTIFICATION_PEM"),
