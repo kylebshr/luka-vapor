@@ -68,7 +68,7 @@ struct LiveActivityJob: AsyncJob {
 
         let now = Date()
         let timestamp = now.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
-        app.logger.notice("🔔 \(payload.logID) Job dequeued at \(timestamp)")
+        app.logger.notice("📤 \(payload.logID) Job dequeued at \(timestamp)")
 
         // Check if this job's ID matches the current active job ID
         // This prevents duplicate jobs when a new activity starts before the old one's jobs finish
