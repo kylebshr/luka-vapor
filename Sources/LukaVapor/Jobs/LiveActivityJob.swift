@@ -47,7 +47,7 @@ struct LiveActivityJob: AsyncJob {
     }
 
     // Constants
-    private static let minInterval: TimeInterval = 5
+    private static let minInterval: TimeInterval = 3
     private static let maxInterval: TimeInterval = 60
     private static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     private static let maximumDuration: TimeInterval = 60 * 60 * 7.5 // 7.5 hours
@@ -209,7 +209,7 @@ struct LiveActivityJob: AsyncJob {
             // Wait for next expected reading
             let timeSinceReading = Date.now.timeIntervalSince(latestReading.date)
             let timeUntilNextReading = Self.readingInterval - timeSinceReading
-            let delay = max(timeUntilNextReading + 2, Self.minInterval)
+            let delay = max(timeUntilNextReading + Self.minInterval, Self.minInterval)
             try await reschedule(
                 context: context,
                 payload: payload,
@@ -218,7 +218,6 @@ struct LiveActivityJob: AsyncJob {
                 delay: delay,
                 sessionCapture: sessionCapture
             )
-
         } catch let error as DexcomClientError {
             app.logger.error("\(payload.logID) Ending polling due to DexcomClientError: \(error)")
             await sendEndEvent(app: app, payload: payload)
