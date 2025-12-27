@@ -98,9 +98,6 @@ struct LiveActivityJob: AsyncJob {
         )
         client.delegate = sessionCapture
 
-        var nextPollInterval = payload.pollInterval
-        var nextLastReading = payload.lastReading
-
         do {
             // Fetch latest readings
             app.logger.notice("☁️  \(payload.logID) Fetching latest readings")
@@ -110,13 +107,13 @@ struct LiveActivityJob: AsyncJob {
 
             guard let latestReading = readings.last else {
                 app.logger.warning("🚫 \(payload.logID) No readings available")
-                nextPollInterval = min(nextPollInterval * 1.5, Self.maxInterval)
+                let nextPollInterval = min(payload.pollInterval * 1.5, Self.maxInterval)
                 try await reschedule(
                     context: context,
                     payload: payload,
                     pollInterval: nextPollInterval,
-                    lastReading: nextLastReading,
-                    delay: nextPollInterval,
+                    lastReading: payload.lastReading,
+                    delay: payload.pollInterval,
                     sessionCapture: sessionCapture
                 )
                 return
@@ -129,37 +126,30 @@ struct LiveActivityJob: AsyncJob {
 
                 if timeSinceLastReading > Self.readingInterval {
                     // Reading is overdue, poll with backoff
-                    app.logger.notice("😴 \(payload.logID) No new reading - polling in \(nextPollInterval)s")
-                    nextPollInterval = min(nextPollInterval * 1.5, Self.maxInterval)
+                    let nextPollInterval = min(payload.pollInterval * 1.5, Self.maxInterval)
                     try await reschedule(
                         context: context,
                         payload: payload,
                         pollInterval: nextPollInterval,
-                        lastReading: nextLastReading,
-                        delay: nextPollInterval,
+                        lastReading: payload.lastReading,
+                        delay: payload.pollInterval,
                         sessionCapture: sessionCapture
                     )
                 } else {
                     // Still within normal reading window, wait for next expected reading
                     let timeUntilNextReading = Self.readingInterval - timeSinceLastReading
                     let delay = max(timeUntilNextReading + 2, Self.minInterval) // extra 2s buffer
-                    app.logger.notice("😴 \(payload.logID) Next reading expected in \(timeUntilNextReading)s - sleeping...")
-                    nextPollInterval = Self.minInterval // Reset backoff
                     try await reschedule(
                         context: context,
                         payload: payload,
-                        pollInterval: nextPollInterval,
-                        lastReading: nextLastReading,
+                        pollInterval: Self.minInterval,
+                        lastReading: payload.lastReading,
                         delay: delay,
                         sessionCapture: sessionCapture
                     )
                 }
                 return
             }
-
-            // New reading available!
-            nextLastReading = latestReading
-            nextPollInterval = Self.minInterval // Reset backoff
 
             app.logger.notice("✅ \(payload.logID) New reading available - sending push")
 
@@ -213,8 +203,8 @@ struct LiveActivityJob: AsyncJob {
             try await reschedule(
                 context: context,
                 payload: payload,
-                pollInterval: nextPollInterval,
-                lastReading: nextLastReading,
+                pollInterval: Self.minInterval,
+                lastReading: latestReading,
                 delay: delay,
                 sessionCapture: sessionCapture
             )
@@ -233,37 +223,35 @@ struct LiveActivityJob: AsyncJob {
                   Status: \(statusCode)
                   Body: \(bodyString)
                 """)
-            if nextPollInterval >= Self.maxInterval {
+            if payload.pollInterval >= Self.maxInterval {
                 app.logger.error("\(payload.logID) Done retrying due to errors, ending activity")
                 await sendEndEvent(app: app, payload: payload)
                 _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
             } else {
-                app.logger.error("\(payload.logID) Retrying in \(nextPollInterval)s")
-                nextPollInterval = min(nextPollInterval * 3, Self.maxInterval)
+                let nextPollInterval = min(payload.pollInterval * 3, Self.maxInterval)
                 try await reschedule(
                     context: context,
                     payload: payload,
                     pollInterval: nextPollInterval,
-                    lastReading: nextLastReading,
-                    delay: nextPollInterval,
+                    lastReading: payload.lastReading,
+                    delay: payload.pollInterval,
                     sessionCapture: sessionCapture
                 )
             }
         } catch {
             app.logger.error("\(payload.logID) Error polling for session: \(error)")
-            if nextPollInterval >= Self.maxInterval {
+            if payload.pollInterval >= Self.maxInterval {
                 app.logger.error("\(payload.logID) Done retrying due to errors, ending activity")
                 await sendEndEvent(app: app, payload: payload)
                 _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
             } else {
-                app.logger.error("\(payload.logID) Retrying in \(nextPollInterval)s")
-                nextPollInterval = min(nextPollInterval * 3, Self.maxInterval)
+                let nextPollInterval = min(payload.pollInterval * 3, Self.maxInterval)
                 try await reschedule(
                     context: context,
                     payload: payload,
                     pollInterval: nextPollInterval,
-                    lastReading: nextLastReading,
-                    delay: nextPollInterval,
+                    lastReading: payload.lastReading,
+                    delay: payload.pollInterval,
                     sessionCapture: sessionCapture
                 )
             }
@@ -339,6 +327,8 @@ struct LiveActivityJob: AsyncJob {
             maxRetryCount: 3,
             delayUntil: Date().addingTimeInterval(delay)
         )
+
+        context.application.logger.notice("😴 \(payload.logID) Checking for new readings in \(delay)s")
     }
 
     private func sendEndEvent(app: Application, payload: LiveActivityJobPayload) async {
