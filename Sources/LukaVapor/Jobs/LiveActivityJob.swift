@@ -66,6 +66,10 @@ struct LiveActivityJob: AsyncJob {
     func dequeue(_ context: QueueContext, _ payload: LiveActivityJobPayload) async throws {
         let app = context.application
 
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        app.logger.notice("🔔 \(payload.logID) Job dequeued at \(formatter.string(from: Date()))")
+
         // Check if this job's ID matches the current active job ID
         // This prevents duplicate jobs when a new activity starts before the old one's jobs finish
         let currentJobID = try await app.redis.get(Self.activeKey(for: payload), as: String.self).get()
@@ -322,14 +326,19 @@ struct LiveActivityJob: AsyncJob {
             lastReading: lastReading,
             pollInterval: pollInterval
         )
+
+        let scheduledTime = Date().addingTimeInterval(delay)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
         try await context.queue.dispatch(
             LiveActivityJob.self,
             newPayload,
             maxRetryCount: 3,
-            delayUntil: Date().addingTimeInterval(delay)
+            delayUntil: scheduledTime
         )
 
-        context.application.logger.notice("😴 \(payload.logID) Checking for new readings in \(delay)s")
+        context.application.logger.notice("😴 \(payload.logID) Scheduled for \(formatter.string(from: scheduledTime)) (in \(delay)s)")
     }
 
     private func sendEndEvent(app: Application, payload: LiveActivityJobPayload) async {
