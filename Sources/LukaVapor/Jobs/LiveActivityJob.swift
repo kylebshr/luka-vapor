@@ -105,7 +105,7 @@ struct LiveActivityJob: AsyncJob {
 
         do {
             // Fetch latest readings
-            app.logger.notice("☁️  \(payload.logID) Fetching latest readings")
+            app.logger.notice("🔄 \(payload.logID) Polling for new readings")
             let readings = try await client.getGlucoseReadings(
                 duration: .init(value: payload.duration, unit: .seconds)
             ).sorted { $0.date < $1.date }
