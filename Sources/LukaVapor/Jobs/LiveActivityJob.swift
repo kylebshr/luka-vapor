@@ -222,6 +222,33 @@ struct LiveActivityJob: AsyncJob {
             app.logger.error("\(payload.logID) Ending polling due to DexcomClientError: \(error)")
             await sendEndEvent(app: app, payload: payload)
             _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
+        } catch let error as DexcomDecodingError {
+            let bodyString = String(data: error.body, encoding: .utf8) ?? "<non-utf8 data, \(error.body.count) bytes>"
+            let httpResponse = error.response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode.description ?? "unknown"
+            let url = error.response.url?.absoluteString ?? "unknown"
+            app.logger.error("""
+                \(payload.logID) 🤬 DexcomDecodingError: \(error.error)
+                  URL: \(url)
+                  Status: \(statusCode)
+                  Body: \(bodyString)
+                """)
+            if nextPollInterval >= Self.maxInterval {
+                app.logger.error("\(payload.logID) Done retrying due to errors, ending activity")
+                await sendEndEvent(app: app, payload: payload)
+                _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
+            } else {
+                app.logger.error("\(payload.logID) Retrying in \(nextPollInterval)s")
+                nextPollInterval = min(nextPollInterval * 3, Self.maxInterval)
+                try await reschedule(
+                    context: context,
+                    payload: payload,
+                    pollInterval: nextPollInterval,
+                    lastReading: nextLastReading,
+                    delay: nextPollInterval,
+                    sessionCapture: sessionCapture
+                )
+            }
         } catch {
             app.logger.error("\(payload.logID) Error polling for session: \(error)")
             if nextPollInterval >= Self.maxInterval {
@@ -359,3 +386,4 @@ extension LiveActivityJob.LiveActivityJobPayload {
         }
     }
 }
+

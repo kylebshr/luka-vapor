@@ -1,5 +1,5 @@
 {
-  "originHash" : "e1e3f7a2a5c9215ef8bb8854a49437575625cb594471015ff64a1cf2eaefe79a",
+  "originHash" : "809ed1f408d75cac2520da659d02df506acc588549fd5485cb4ca66af1056b9c",
   "pins" : [
     {
       "identity" : "apns",
@@ -52,7 +52,7 @@
       "location" : "https://github.com/kylebshr/dexcom-swift",
       "state" : {
         "branch" : "main",
-        "revision" : "049afc2f2ca150d59f841ff08b017324fa7bfc38"
+        "revision" : "725a60ebc4e36b85209d792b9a7c979ecdc3dac2"
       }
     },
     {
