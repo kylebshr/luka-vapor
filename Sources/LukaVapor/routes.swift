@@ -55,9 +55,11 @@ func routes(_ app: Application) throws {
             lastReading: nil,
             pollInterval: 5
         )
+        let dispatchTime = Date()
         try await req.queue.dispatch(LiveActivityJob.self, payload, maxRetryCount: 3)
 
-        req.logger.notice("🆕 \(body.logID) Started Live Activity polling")
+        let timestamp = dispatchTime.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
+        req.logger.notice("🆕 \(body.logID) Started Live Activity polling, dispatched at \(timestamp)")
 
         return .ok
     }
