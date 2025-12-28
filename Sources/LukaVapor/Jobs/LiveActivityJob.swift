@@ -220,46 +220,72 @@ struct LiveActivityJob: AsyncJob {
         } catch let error as DexcomDecodingError {
             let bodyString = String(data: error.body, encoding: .utf8) ?? "<non-utf8 data, \(error.body.count) bytes>"
             let httpResponse = error.response as? HTTPURLResponse
-            let statusCode = httpResponse?.statusCode.description ?? "unknown"
+            let statusCode = httpResponse?.statusCode
+            let statusCodeString = statusCode?.description ?? "unknown"
             let url = error.response.url?.absoluteString ?? "unknown"
             app.logger.error("""
                 \(payload.logID) 🤬 DexcomDecodingError: \(error.error)
                   URL: \(url)
-                  Status: \(statusCode)
+                  Status: \(statusCodeString)
                   Body: \(bodyString)
                 """)
-            if payload.pollInterval >= Self.maxInterval {
-                app.logger.error("\(payload.logID) Done retrying due to errors, ending activity")
-                await sendEndEvent(app: app, payload: payload)
-                _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
-            } else {
-                let nextPollInterval = min(payload.pollInterval * 3, Self.maxInterval)
-                try await reschedule(
+
+            // Special handling for 429 rate limit errors
+            if statusCode == 429 {
+                try await handleRetry(
                     context: context,
                     payload: payload,
-                    pollInterval: nextPollInterval,
-                    lastReading: payload.lastReading,
-                    delay: payload.pollInterval,
-                    sessionCapture: sessionCapture
+                    sessionCapture: sessionCapture,
+                    backoffMultiplier: 1.0, // Don't increase poll interval for temporary rate limits
+                    customDelay: 15.0,
+                    reason: "Rate limited (429)"
+                )
+            } else {
+                try await handleRetry(
+                    context: context,
+                    payload: payload,
+                    sessionCapture: sessionCapture,
+                    backoffMultiplier: 3.0,
+                    reason: "DexcomDecodingError"
                 )
             }
         } catch {
             app.logger.error("\(payload.logID) Error polling for session: \(error)")
-            if payload.pollInterval >= Self.maxInterval {
-                app.logger.error("\(payload.logID) Done retrying due to errors, ending activity")
-                await sendEndEvent(app: app, payload: payload)
-                _ = try await app.redis.delete(Self.activeKey(for: payload)).get()
-            } else {
-                let nextPollInterval = min(payload.pollInterval * 3, Self.maxInterval)
-                try await reschedule(
-                    context: context,
-                    payload: payload,
-                    pollInterval: nextPollInterval,
-                    lastReading: payload.lastReading,
-                    delay: payload.pollInterval,
-                    sessionCapture: sessionCapture
-                )
-            }
+            try await handleRetry(
+                context: context,
+                payload: payload,
+                sessionCapture: sessionCapture,
+                backoffMultiplier: 3.0,
+                reason: "Unexpected error"
+            )
+        }
+    }
+
+    /// Centralized retry logic for handling various error scenarios
+    private func handleRetry(
+        context: QueueContext,
+        payload: LiveActivityJobPayload,
+        sessionCapture: SessionCapture,
+        backoffMultiplier: Double = 3.0,
+        customDelay: TimeInterval? = nil,
+        reason: String
+    ) async throws {
+        if payload.pollInterval >= Self.maxInterval {
+            context.application.logger.error("\(payload.logID) Done retrying due to errors (\(reason)), ending activity")
+            await sendEndEvent(app: context.application, payload: payload)
+            _ = try await context.application.redis.delete(Self.activeKey(for: payload)).get()
+        } else {
+            let nextPollInterval = min(payload.pollInterval * backoffMultiplier, Self.maxInterval)
+            let delay = customDelay ?? payload.pollInterval
+            context.application.logger.notice("\(payload.logID) \(reason), retrying in \(delay)s")
+            try await reschedule(
+                context: context,
+                payload: payload,
+                pollInterval: nextPollInterval,
+                lastReading: payload.lastReading,
+                delay: delay,
+                sessionCapture: sessionCapture
+            )
         }
     }
 
