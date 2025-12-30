@@ -244,15 +244,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let statusCode = httpResponse?.statusCode.description ?? "unknown"
         app.logger.error("🚫 \(data.logID) DexcomDecodingError status: \(statusCode) body: \(bodyString)")
 
-        if data.pollInterval >= Self.maxInterval && data.retryCount > 3 {
-            app.logger.error("\(data.logID) Done retrying due to errors, ending activity")
+        if data.pollInterval >= Self.maxInterval && data.retryCount > 5 {
+            app.logger.error("🤬 \(data.logID) Done retrying due to errors, ending activity")
             await endActivity(app: app, data: data, reason: .tooManyRetries)
         } else {
-            let nextPollInterval = if httpResponse?.statusCode == 429 {
-                Self.maxInterval // wait longer when we get rate limited
-            } else {
-                min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
-            }
+            let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
+            let delay = httpResponse?.statusCode == 429 ? Self.maxInterval : data.pollInterval
 
             var updatedData = data
             updatedData.retryCount += 1
@@ -262,7 +259,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 data: updatedData,
                 pollInterval: nextPollInterval,
                 lastReading: data.lastReading,
-                delay: data.pollInterval,
+                delay: delay,
                 sessionCapture: sessionCapture,
                 resetRetries: false
             )
@@ -278,7 +275,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         app.logger.error("🚫 \(data.logID) Error polling for session: \(error)")
 
         if data.pollInterval >= Self.maxInterval && data.retryCount >= 3 {
-            app.logger.error("\(data.logID) Done retrying due to errors, ending activity")
+            app.logger.error("🤬 \(data.logID) Done retrying due to errors, ending activity")
             await endActivity(app: app, data: data, reason: .tooManyRetries)
         } else {
             let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
