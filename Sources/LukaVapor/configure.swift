@@ -20,6 +20,7 @@ public func configure(_ app: Application) async throws {
 
     // Set aggressive polling for low-latency job execution
     app.queues.configuration.refreshInterval = .milliseconds(500)
+    app.queues.configuration.workerCount = 100
 
     // Configure APNS
     if let pemString = Environment.get("PUSH_NOTIFICATION_PEM"),
