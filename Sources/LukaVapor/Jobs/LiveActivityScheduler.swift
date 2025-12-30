@@ -249,7 +249,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             await endActivity(app: app, data: data, reason: .tooManyRetries)
         } else {
             let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
-            let delay = httpResponse?.statusCode == 429 ? Self.maxInterval : data.pollInterval
+            let delay = httpResponse?.statusCode == 429 ? 60 : data.pollInterval // wait a whole minute after a 429
 
             var updatedData = data
             updatedData.retryCount += 1
