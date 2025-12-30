@@ -29,7 +29,7 @@ func routes(_ app: Application) throws {
         // Delete activity data hash
         _ = try await req.redis.delete(LiveActivityKeys.dataKey(for: activityID)).get()
 
-        req.logger.notice("⏹️  Ended Live Activity for \(activityID.prefix(8))...")
+        req.logger.info("⏹️  Ended Live Activity for \(activityID.prefix(8))...")
 
         return .ok
     }
@@ -73,7 +73,7 @@ func routes(_ app: Application) throws {
             to: LiveActivityKeys.scheduleKey
         ).get()
 
-        req.logger.notice("🆕 \(body.logID) Started Live Activity polling")
+        req.logger.info("🆕 \(body.logID) Started Live Activity polling")
 
         return .ok
     }

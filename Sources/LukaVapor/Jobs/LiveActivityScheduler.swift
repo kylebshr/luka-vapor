@@ -52,7 +52,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         guard !dueActivities.isEmpty else { return }
 
-        context.logger.notice("📥 Dequeued activities (\(dueActivities.count))")
+        context.logger.info("📥 Dequeued activities (\(dueActivities.count))")
 
         // Process each due activity concurrently
         await withTaskGroup(of: Void.self) { group in
@@ -131,7 +131,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             // Check max duration
             if now.timeIntervalSince(data.startDate) >= Self.maximumDuration {
-                app.logger.notice("🕟 \(data.logID) Reached maximum duration, ending live activity")
+                app.logger.info("🕟 \(data.logID) Reached maximum duration, ending live activity")
                 await endActivity(app: app, data: data, reason: .maxDuration)
                 return
             }
@@ -157,7 +157,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         do {
             // Fetch latest readings
-            app.logger.notice("🔄 \(data.logID) Checking for new readings")
+            app.logger.info("🔄 \(data.logID) Checking for new readings")
             let readings = try await client.getGlucoseReadings(
                 duration: .init(value: data.duration, unit: .seconds)
             ).sorted { $0.date < $1.date }
@@ -208,7 +208,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            app.logger.notice("✅ \(data.logID) New reading available - sending push")
+            app.logger.info("✅ \(data.logID) New reading available - sending push")
 
             // Send push notification and schedule next poll (or end activity on fatal APNS error)
             await sendUpdateAndScheduleNext(
@@ -357,7 +357,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             let scheduledTime = Date(timeIntervalSince1970: nextTimestamp)
                 .formatted(.dateTime.hour().minute().second())
             let formattedDelay = Duration.seconds(delay).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .abbreviated))
-            app.logger.notice("😴 \(data.logID) Scheduled for \(scheduledTime) (in \(formattedDelay))")
+            app.logger.info("😴 \(data.logID) Scheduled for \(scheduledTime) (in \(formattedDelay))")
         } catch {
             app.logger.error("Failed to reschedule \(data.logID): \(error)")
         }
@@ -383,7 +383,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         // Delete data hash
         await deleteActivityData(app: app, id: data.id)
 
-        app.logger.notice("🛑 \(data.logID) Activity ended: \(reason.rawValue)")
+        app.logger.info("🛑 \(data.logID) Activity ended: \(reason.rawValue)")
     }
 
     // MARK: - APNS
@@ -425,7 +425,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 ),
                 deviceToken: data.pushToken.rawValue
             )
-            app.logger.notice("🚚 \(data.logID) Sent Live Activity push to \(data.pushToken.rawValue.prefix(8))")
+            app.logger.info("🚚 \(data.logID) Sent Live Activity push to \(data.pushToken.rawValue.prefix(8))")
         } catch let error as APNSCore.APNSError {
             app.logger.error("\(data.logID) APNS error: \(error)")
             // If token is invalid, stop polling

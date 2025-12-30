@@ -17,7 +17,7 @@ primary_region = 'sjc'
   processes = ['app']
 
 [env]
-  LOG_LEVEL = 'notice'
+  LOG_LEVEL = 'info'
 
 [[vm]]
   memory = '256mb'
