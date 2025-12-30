@@ -18,9 +18,6 @@ public func configure(_ app: Application) async throws {
     // Configure Queues with Redis
     try app.queues.use(.redis(url: redisURL))
 
-    app.queues.configuration.refreshInterval = .milliseconds(250)
-    app.queues.configuration.workerCount = 10
-
     // Configure APNS
     if let pemString = Environment.get("PUSH_NOTIFICATION_PEM"),
        let keyID = Environment.get("PUSH_NOTIFICATION_ID"),
@@ -66,9 +63,9 @@ public func configure(_ app: Application) async throws {
     // register routes
     try routes(app)
 
-    // Register jobs
-    app.queues.add(LiveActivityJob())
+    // Register scheduled job to run every second
+    app.queues.schedule(LiveActivityScheduler()).everySecond()
 
-    // Start queue worker in-process
-    try app.queues.startInProcessJobs()
+    // Start scheduled jobs worker
+    try app.queues.startScheduledJobs()
 }

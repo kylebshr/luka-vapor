@@ -12,20 +12,24 @@ func routes(_ app: Application) throws {
     app.post("end-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivityRequest.self)
 
-        // Build the key from the request
-        let key: RedisKey
+        // Determine activity ID from request
+        let activityID: String
         if let username = body.username {
-            key = RedisKey("live-activity:\(username)")
+            activityID = username
         } else if let pushToken = body.pushToken {
-            key = RedisKey("live-activity:\(pushToken.rawValue)")
+            activityID = pushToken.rawValue
         } else {
             req.logger.error("Must provide username or pushToken")
             throw Abort(.badRequest, reason: "Must provide username or pushToken")
         }
 
-        // Delete the key - job will see it's gone and stop rescheduling
-        let count = try await req.redis.delete(key).get()
-        req.logger.notice("🛑 Ended Live Activity \(count) session(s)")
+        // Remove from schedule sorted set
+        _ = try await req.redis.zrem(activityID, from: LiveActivityKeys.scheduleKey).get()
+
+        // Delete activity data hash
+        _ = try await req.redis.delete(LiveActivityKeys.dataKey(for: activityID)).get()
+
+        req.logger.notice("⏹️  Ended Live Activity for \(activityID.prefix(8))...")
 
         return .ok
     }
@@ -33,33 +37,43 @@ func routes(_ app: Application) throws {
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        // Generate unique job ID - any old jobs with different IDs will stop themselves
-        let jobID = UUID()
+        let activityID = LiveActivityData.makeID(username: body.username, pushToken: body.pushToken)
 
-        // Store the job ID (replaces any previous ID, invalidating old jobs)
-        try await req.redis.set(LiveActivityJob.activeKey(for: body), to: jobID.uuidString).get()
-
-        // Dispatch the job with initial payload
-        let payload = LiveActivityJob.LiveActivityJobPayload(
+        // Create activity data
+        let data = LiveActivityData(
+            id: activityID,
             pushToken: body.pushToken,
             environment: body.environment,
+            accountLocation: body.accountLocation,
+            duration: body.duration,
             username: body.username,
             password: body.password,
             accountID: body.accountID,
             sessionID: body.sessionID,
-            accountLocation: body.accountLocation,
-            duration: body.duration,
             preferences: body.preferences,
-            jobID: jobID,
             startDate: Date.now,
+            lastReadingDate: nil,
             lastReading: nil,
-            pollInterval: 5
+            pollInterval: LiveActivityScheduler.minInterval,
+            retryCount: 0
         )
-        let dispatchTime = Date()
-        try await req.queue.dispatch(LiveActivityJob.self, payload, maxRetryCount: 3)
 
-        let timestamp = dispatchTime.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
-        req.logger.notice("🆕 \(body.logID) Started Live Activity polling, dispatched at \(timestamp)")
+        // Store in Redis hash
+        let dataKey = LiveActivityKeys.dataKey(for: activityID)
+        let jsonData = try JSONEncoder().encode(data)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw Abort(.internalServerError, reason: "Failed to encode activity data")
+        }
+        _ = try await req.redis.hset("data", to: jsonString, in: dataKey).get()
+
+        // Add to schedule sorted set (immediate execution)
+        let nowTimestamp = Date.now.timeIntervalSince1970
+        _ = try await req.redis.zadd(
+            (element: activityID, score: nowTimestamp),
+            to: LiveActivityKeys.scheduleKey
+        ).get()
+
+        req.logger.notice("🆕 \(body.logID) Started Live Activity polling")
 
         return .ok
     }
