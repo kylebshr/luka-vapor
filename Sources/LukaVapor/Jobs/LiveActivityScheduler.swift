@@ -35,11 +35,11 @@ enum LiveActivityKeys {
 /// A scheduled job that runs every second to process due live activities.
 /// Uses Redis sorted set for scheduling and hash for activity data.
 struct LiveActivityScheduler: AsyncScheduledJob {
-    static let minInterval: TimeInterval = 2
+    static let minInterval: TimeInterval = 3
     static let maxInterval: TimeInterval = 30
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let maximumDuration: TimeInterval = 60 * 60 * 7.75 // 7h45m
-    static let backoff: TimeInterval = 1.25
+    static let backoff: TimeInterval = 1.5
     static let errorBackoff: TimeInterval = 3
 
     func run(context: QueueContext) async throws {
