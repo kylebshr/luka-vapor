@@ -52,7 +52,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         guard !dueActivities.isEmpty else { return }
 
-        context.logger.notice("📥 Dequeued \(dueActivities.count) activities")
+        context.logger.notice("📥 Dequeued activities (\(dueActivities.count))")
 
         // Process each due activity concurrently
         await withTaskGroup(of: Void.self) { group in
@@ -128,8 +128,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 await removeFromSchedule(app: app, id: id)
                 return
             }
-
-            let timestamp = now.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
 
             // Check max duration
             if now.timeIntervalSince(data.startDate) >= Self.maximumDuration {
@@ -358,7 +356,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             let scheduledTime = Date(timeIntervalSince1970: nextTimestamp)
                 .formatted(.dateTime.hour().minute().second())
-            app.logger.notice("😴 \(data.logID) Scheduled for \(scheduledTime) (in \(delay)s)")
+            let formattedDelay = Duration.seconds(delay).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .abbreviated))
+            app.logger.notice("😴 \(data.logID) Scheduled for \(scheduledTime) (in \(formattedDelay))")
         } catch {
             app.logger.error("Failed to reschedule \(data.logID): \(error)")
         }
