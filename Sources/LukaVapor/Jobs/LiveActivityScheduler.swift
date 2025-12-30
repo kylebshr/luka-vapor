@@ -52,7 +52,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         guard !dueActivities.isEmpty else { return }
 
-        context.logger.notice("🥞 Dequeued \(dueActivities.count) activities")
+        context.logger.notice("📥 Dequeued \(dueActivities.count) activities")
 
         // Process each due activity concurrently
         await withTaskGroup(of: Void.self) { group in
@@ -130,7 +130,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             }
 
             let timestamp = now.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))
-            app.logger.notice("📤 \(data.logID) Processing at \(timestamp)")
 
             // Check max duration
             if now.timeIntervalSince(data.startDate) >= Self.maximumDuration {
