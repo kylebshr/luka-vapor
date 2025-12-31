@@ -1,5 +1,5 @@
 import Foundation
-@preconcurrency import Dexcom
+import Dexcom
 
 /// Stored in Redis as JSON for live activity state persistence.
 /// All optional fields support backwards-compatible additions.

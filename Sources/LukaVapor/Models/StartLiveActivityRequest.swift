@@ -6,7 +6,7 @@
 //
 
 import Foundation
-@preconcurrency import Dexcom
+import Dexcom
 
 enum PushEnvironment: String, Codable, Sendable {
     case development

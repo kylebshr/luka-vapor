@@ -4,7 +4,7 @@ import FoundationNetworking
 import Vapor
 import Queues
 @preconcurrency import Redis
-@preconcurrency import Dexcom
+import Dexcom
 import APNS
 import APNSCore
 import VaporAPNS
@@ -146,14 +146,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func pollAndUpdate(app: Application, data: LiveActivityData, now: Date) async {
         let sessionCapture = SessionCapture()
-        nonisolated(unsafe) let client = DexcomClient(
+        let client = DexcomClient(
             username: data.username,
             password: data.password,
             existingAccountID: data.accountID,
             existingSessionID: data.sessionID,
             accountLocation: data.accountLocation
         )
-        client.delegate = sessionCapture
+        await client.setDelegate(sessionCapture)
 
         do {
             // Fetch latest readings
@@ -240,8 +240,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         sessionCapture: SessionCapture
     ) async {
         let bodyString = String(data: error.body, encoding: .utf8) ?? "<non-utf8 data, \(error.body.count) bytes>"
-        let httpResponse = error.response as? HTTPURLResponse
-        let statusCode = httpResponse?.statusCode.description ?? "unknown"
+        let statusCode = error.statusCode?.description ?? "unknown"
         app.logger.error("🚫 \(data.logID) DexcomDecodingError status: \(statusCode) body: \(bodyString)")
 
         if data.pollInterval >= Self.maxInterval && data.retryCount > 5 {
@@ -249,7 +248,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             await endActivity(app: app, data: data, reason: .tooManyRetries)
         } else {
             let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
-            let delay = httpResponse?.statusCode == 429 ? 60 : data.pollInterval // wait a whole minute after a 429
+            let delay = error.statusCode == 429 ? 60 : data.pollInterval // wait a whole minute after a 429
 
             var updatedData = data
             updatedData.retryCount += 1
