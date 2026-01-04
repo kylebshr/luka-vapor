@@ -56,6 +56,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         for activityID in dueActivities {
             await processActivity(id: activityID, app: app, now: now)
+            try? await Task.sleep(for: .milliseconds(300))
         }
     }
 
