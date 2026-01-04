@@ -23,24 +23,6 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
     }
 }
 
-/// Global throttle to prevent hitting Dexcom rate limits.
-/// Ensures a minimum delay between API requests across all activities.
-actor DexcomThrottle {
-    static let shared = DexcomThrottle()
-
-    private var lastRequestTime: Date = .distantPast
-    private let minDelay: TimeInterval = 0.5 // 500ms between requests
-
-    func acquire() async {
-        let elapsed = Date().timeIntervalSince(lastRequestTime)
-        if elapsed < minDelay {
-            let waitTime = minDelay - elapsed
-            try? await Task.sleep(for: .seconds(waitTime))
-        }
-        lastRequestTime = Date()
-    }
-}
-
 /// Redis key helpers for live activity storage
 enum LiveActivityKeys {
     static let scheduleKey = RedisKey("live-activities:schedule")
@@ -176,10 +158,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         do {
             // Fetch latest readings
             app.logger.info("🔄 \(data.logID) Checking for new readings")
-
-            // Throttle requests to avoid hitting Dexcom rate limits
-            await DexcomThrottle.shared.acquire()
-
             let readings = try await client.getGlucoseReadings(
                 duration: .init(value: data.duration, unit: .seconds)
             ).sorted { $0.date < $1.date }
