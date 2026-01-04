@@ -243,7 +243,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             await endActivity(app: app, data: data, reason: .tooManyRetries)
         } else {
             let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
-            let delay = error.statusCode == 429 ? 60 : data.pollInterval // wait a whole minute after a 429
+            let delay = error.statusCode == 429 ? 60 + jitter() : data.pollInterval // wait a whole minute after a 429
 
             var updatedData = data
             updatedData.retryCount += 1
@@ -287,6 +287,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 resetRetries: false
             )
         }
+    }
+
+    private func jitter() -> TimeInterval {
+        TimeInterval.random(in: 0...5)
     }
 
     // MARK: - Scheduling
