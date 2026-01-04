@@ -290,7 +290,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     }
 
     private func jitter() -> TimeInterval {
-        TimeInterval.random(in: 0...5)
+        TimeInterval.random(in: -10...10)
     }
 
     // MARK: - Scheduling
