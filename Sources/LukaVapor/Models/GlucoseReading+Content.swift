@@ -8,5 +8,4 @@
 import Dexcom
 import Vapor
 
-extension GlucoseReading: @retroactive @unchecked Sendable {}
 extension GlucoseReading: @retroactive Content {}
