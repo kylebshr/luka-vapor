@@ -54,13 +54,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         context.logger.info("📥 Dequeued activities (\(dueActivities.count))")
 
-        // Process each due activity concurrently
-        await withTaskGroup(of: Void.self) { group in
-            for activityID in dueActivities {
-                group.addTask {
-                    await self.processActivity(id: activityID, app: app, now: now)
-                }
-            }
+        for activityID in dueActivities {
+            await processActivity(id: activityID, app: app, now: now)
         }
     }
 
