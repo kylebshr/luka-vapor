@@ -146,7 +146,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func pollAndUpdate(app: Application, data: LiveActivityData, now: Date) async {
         let sessionCapture = SessionCapture()
-        let client = DexcomClient(
+        let client = await DexcomClient(
             username: data.username,
             password: data.password,
             existingAccountID: data.accountID,
