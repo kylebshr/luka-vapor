@@ -307,7 +307,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     ) async {
         let timeSinceReading = now.timeIntervalSince(readingDate)
         let timeUntilNextReading = Self.readingInterval - timeSinceReading
-        let delay = max(timeUntilNextReading + Self.minInterval, Self.minInterval)
+        let delay = timeUntilNextReading + 10 // give 10s to try to ensure reading is ready
         await reschedule(
             app: app,
             data: data,
