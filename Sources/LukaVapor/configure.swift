@@ -8,8 +8,8 @@ import QueuesRedisDriver
 
 // configures your application
 public func configure(_ app: Application) async throws {
-    // uncomment to serve files from /Public folder
-    app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
+    // Block bot/scanner traffic probing for PHP vulnerabilities
+    app.middleware.use(BotBlockerMiddleware())
 
     // Configure Redis (use REDIS_URL env var on Fly, localhost for local dev)
     let redisURL = Environment.get("REDIS_URL") ?? "redis://localhost:6379"
