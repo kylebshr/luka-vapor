@@ -29,6 +29,10 @@ struct LiveActivityData: Codable, Sendable {
     var pollInterval: TimeInterval
     var retryCount: Int
 
+    // Token expiration grace period - when set, we're waiting for iOS to send a new token
+    // Optional for backwards compatibility with existing Redis data
+    var tokenExpiredAt: Date?
+
     /// Creates an activity ID from username or push token
     static func makeID(username: String?, pushToken: LiveActivityPushToken) -> String {
         username ?? pushToken.rawValue
