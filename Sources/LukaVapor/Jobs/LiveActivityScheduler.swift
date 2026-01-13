@@ -328,19 +328,29 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         sessionCapture: SessionCapture,
         resetRetries: Bool
     ) async {
-        var updatedData = data
-        updatedData.pollInterval = pollInterval
-        updatedData.lastReading = lastReading
-        updatedData.lastReadingDate = lastReading?.date
-        updatedData.accountID = sessionCapture.accountID ?? data.accountID
-        updatedData.sessionID = sessionCapture.sessionID ?? data.sessionID
-        if resetRetries {
-            updatedData.retryCount = 0
-        }
-
         let nextTimestamp = Date().addingTimeInterval(delay).timeIntervalSince1970
 
         do {
+            // Re-load current data from Redis to preserve any token updates that
+            // may have arrived while we were processing (e.g., iOS sent a new token)
+            guard let currentData = try await loadActivityData(app: app, id: data.id) else {
+                // Activity was deleted while we were processing, don't reschedule
+                app.logger.info("⚠️ \(data.logID) Activity was deleted during processing, not rescheduling")
+                return
+            }
+
+            // Update only the fields the scheduler manages, preserving pushToken and other
+            // fields that may have been updated by start-live-activity
+            var updatedData = currentData
+            updatedData.pollInterval = pollInterval
+            updatedData.lastReading = lastReading
+            updatedData.lastReadingDate = lastReading?.date
+            updatedData.accountID = sessionCapture.accountID ?? currentData.accountID
+            updatedData.sessionID = sessionCapture.sessionID ?? currentData.sessionID
+            if resetRetries {
+                updatedData.retryCount = 0
+            }
+
             // Update data hash
             try await saveActivityData(app: app, data: updatedData)
 
@@ -424,9 +434,24 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             app.logger.info("🚚 \(data.logID) Sent Live Activity push to \(data.pushToken.rawValue.prefix(8))")
         } catch let error as APNSCore.APNSError {
             app.logger.error("\(data.logID) APNS error: \(error)")
-            // If token is invalid, stop polling
+            // If token is invalid, check if a new token was sent before ending
             if let reason = error.reason {
                 if reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
+                    // Re-load data to check if a new token was sent while we were processing
+                    if let currentData = try? await loadActivityData(app: app, id: data.id),
+                       currentData.pushToken != data.pushToken {
+                        // A new token was sent! Retry with the new token instead of ending
+                        app.logger.info("🔄 \(data.logID) Token was updated during processing, retrying with new token")
+                        await sendUpdateAndScheduleNext(
+                            app: app,
+                            data: currentData,
+                            now: now,
+                            readings: readings,
+                            latestReading: latestReading,
+                            sessionCapture: sessionCapture
+                        )
+                        return
+                    }
                     app.logger.error("\(data.logID) Live Activity ended because \(reason.reason), stopping polling")
                     await endActivity(app: app, data: data, reason: .apnsInvalidToken)
                     return
