@@ -38,7 +38,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let minInterval: TimeInterval = 4
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
-    static let maximumDuration: TimeInterval = 60 * 60 * 7.5 // 7h30
+    static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
 
