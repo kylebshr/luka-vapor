@@ -141,6 +141,29 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     }
 
     private func pollAndUpdate(app: Application, data: LiveActivityData, now: Date) async {
+        var data = data
+
+        // Check if we should send a stale update (before fetching, so we send even if fetch fails)
+        if let lastReadingDate = data.lastReadingDate, let lastReading = data.lastReading {
+            let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
+            if timeSinceLastReading >= Self.readingInterval {
+                let sendStale = data.preferences?.sendStaleUpdates == true
+                let staleMinutes = Int(timeSinceLastReading / 60)
+                let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
+
+                if sendStale, let milestone, data.lastStaleUpdateMinutes != milestone {
+                    app.logger.info("📡 \(data.logID) Sending stale update at \(milestone) minutes")
+                    data.lastStaleUpdateMinutes = milestone
+                    await sendStaleUpdate(
+                        app: app,
+                        data: data,
+                        readings: [lastReading],
+                        latestReading: lastReading
+                    )
+                }
+            }
+        }
+
         let sessionCapture = SessionCapture()
         let client = DexcomClient(
             username: data.username,
@@ -179,30 +202,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 let timeSinceLastReading = now.timeIntervalSince(lastDate)
 
                 if timeSinceLastReading >= Self.readingInterval {
-                    // Reading is overdue - check if we should send a stale update
-                    var updatedData = data
-                    let sendStale = data.preferences?.sendStaleUpdates == true
-                    let staleMinutes = Int(timeSinceLastReading / 60)
-                    let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
-
-                    if sendStale, let milestone, data.lastStaleUpdateMinutes != milestone, let lastReading = data.lastReading {
-                        app.logger.info("📡 \(data.logID) Sending stale update at \(milestone) minutes")
-                        updatedData.lastStaleUpdateMinutes = milestone
-                        await sendStaleUpdate(
-                            app: app,
-                            data: updatedData,
-                            readings: readings,
-                            latestReading: lastReading
-                        )
-                    }
-
-                    // Poll with backoff
+                    // Reading is overdue - poll with backoff
                     let nextPollInterval = min(data.pollInterval * Self.backoff, Self.maxInterval)
                     await reschedule(
                         app: app,
-                        data: updatedData,
+                        data: data,
                         pollInterval: nextPollInterval,
-                        lastReading: updatedData.lastReading,
+                        lastReading: data.lastReading,
                         delay: data.pollInterval,
                         sessionCapture: sessionCapture,
                         resetRetries: false
