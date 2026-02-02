@@ -29,6 +29,9 @@ struct LiveActivityData: Codable, Sendable {
     var pollInterval: TimeInterval
     var retryCount: Int
 
+    /// Tracks which stale milestone was last sent (5 or 10 minutes)
+    var lastStaleUpdateMinutes: Int?
+
     /// Creates an activity ID from username or push token
     static func makeID(username: String?, pushToken: LiveActivityPushToken) -> String {
         username ?? pushToken.rawValue
