@@ -178,14 +178,31 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 // No new reading yet
                 let timeSinceLastReading = now.timeIntervalSince(lastDate)
 
-                if timeSinceLastReading > Self.readingInterval {
-                    // Reading is overdue, poll with backoff
+                if timeSinceLastReading >= Self.readingInterval {
+                    // Reading is overdue - check if we should send a stale update
+                    var updatedData = data
+                    let sendStale = data.preferences?.sendStaleUpdates == true
+                    let staleMinutes = Int(timeSinceLastReading / 60)
+                    let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
+
+                    if sendStale, let milestone, data.lastStaleUpdateMinutes != milestone, let lastReading = data.lastReading {
+                        app.logger.info("📡 \(data.logID) Sending stale update at \(milestone) minutes")
+                        updatedData.lastStaleUpdateMinutes = milestone
+                        await sendStaleUpdate(
+                            app: app,
+                            data: updatedData,
+                            readings: readings,
+                            latestReading: lastReading
+                        )
+                    }
+
+                    // Poll with backoff
                     let nextPollInterval = min(data.pollInterval * Self.backoff, Self.maxInterval)
                     await reschedule(
                         app: app,
-                        data: data,
+                        data: updatedData,
                         pollInterval: nextPollInterval,
-                        lastReading: data.lastReading,
+                        lastReading: updatedData.lastReading,
                         delay: data.pollInterval,
                         sessionCapture: sessionCapture,
                         resetRetries: false
@@ -336,6 +353,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         updatedData.sessionID = sessionCapture.sessionID ?? data.sessionID
         if resetRetries {
             updatedData.retryCount = 0
+            updatedData.lastStaleUpdateMinutes = nil
         }
 
         let nextTimestamp = Date().addingTimeInterval(delay).timeIntervalSince1970
@@ -384,16 +402,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     // MARK: - APNS
 
-    /// Sends a live activity update and schedules the next poll.
-    /// On fatal APNS error (invalid token), ends the activity instead of scheduling.
-    private func sendUpdateAndScheduleNext(
+    /// Sends a live activity update notification.
+    private func sendActivityPush(
         app: Application,
         data: LiveActivityData,
-        now: Date,
         readings: [GlucoseReading],
         latestReading: GlucoseReading,
-        sessionCapture: SessionCapture
-    ) async {
+        alert: APNSAlertNotificationContent? = nil
+    ) async throws {
         let apnsClient = switch data.environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
@@ -404,27 +420,40 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             h: readings.map { .init(t: $0.date, v: Int16($0.value)) }
         )
 
+        let staleDate = Int(Date.now.addingTimeInterval(60 * 10).timeIntervalSince1970)
+        try await apnsClient.sendLiveActivityNotification(
+            .init(
+                expiration: .timeIntervalSince1970InSeconds(staleDate),
+                priority: .immediately,
+                appID: "com.kylebashour.Glimpse",
+                contentState: state,
+                event: .update,
+                alert: alert,
+                timestamp: Int(Date.now.timeIntervalSince1970),
+                dismissalDate: .none,
+                staleDate: staleDate,
+                apnsID: nil
+            ),
+            deviceToken: data.pushToken.rawValue
+        )
+    }
+
+    /// Sends a live activity update and schedules the next poll.
+    /// On fatal APNS error (invalid token), ends the activity instead of scheduling.
+    private func sendUpdateAndScheduleNext(
+        app: Application,
+        data: LiveActivityData,
+        now: Date,
+        readings: [GlucoseReading],
+        latestReading: GlucoseReading,
+        sessionCapture: SessionCapture
+    ) async {
         do {
-            let staleDate = Int(Date.now.addingTimeInterval(60 * 10).timeIntervalSince1970)
-            try await apnsClient.sendLiveActivityNotification(
-                .init(
-                    expiration: .timeIntervalSince1970InSeconds(staleDate),
-                    priority: .immediately,
-                    appID: "com.kylebashour.Glimpse",
-                    contentState: state,
-                    event: .update,
-                    alert: alert(for: latestReading, lastReading: data.lastReading, preferences: data.preferences),
-                    timestamp: Int(Date.now.timeIntervalSince1970),
-                    dismissalDate: .none,
-                    staleDate: staleDate,
-                    apnsID: nil
-                ),
-                deviceToken: data.pushToken.rawValue
-            )
+            let alertContent = alert(for: latestReading, lastReading: data.lastReading, preferences: data.preferences)
+            try await sendActivityPush(app: app, data: data, readings: readings, latestReading: latestReading, alert: alertContent)
             app.logger.info("🚚 \(data.logID) Sent Live Activity push to \(data.pushToken.rawValue.prefix(8))")
         } catch let error as APNSCore.APNSError {
             app.logger.error("\(data.logID) APNS error: \(error)")
-            // If token is invalid, stop polling
             if let reason = error.reason {
                 if reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
                     app.logger.error("\(data.logID) Live Activity ended because \(reason.reason), stopping polling")
@@ -445,6 +474,21 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             reading: latestReading,
             sessionCapture: sessionCapture
         )
+    }
+
+    /// Sends a stale update push to refresh the Live Activity UI without a new reading.
+    private func sendStaleUpdate(
+        app: Application,
+        data: LiveActivityData,
+        readings: [GlucoseReading],
+        latestReading: GlucoseReading
+    ) async {
+        do {
+            try await sendActivityPush(app: app, data: data, readings: readings, latestReading: latestReading)
+            app.logger.info("🚚 \(data.logID) Sent stale update push to \(data.pushToken.rawValue.prefix(8))")
+        } catch {
+            app.logger.error("\(data.logID) Error sending stale update: \(error)")
+        }
     }
 
     private func sendEndEvent(app: Application, data: LiveActivityData) async {
