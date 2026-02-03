@@ -157,7 +157,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     await sendStaleUpdate(
                         app: app,
                         data: data,
-                        readings: [lastReading],
+                        readings: data.readings ?? [lastReading],
                         latestReading: lastReading
                     )
                 }
@@ -189,6 +189,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     data: data,
                     pollInterval: nextPollInterval,
                     lastReading: data.lastReading,
+                    readings: data.readings,
                     delay: data.pollInterval,
                     sessionCapture: sessionCapture,
                     resetRetries: true
@@ -209,6 +210,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                         data: data,
                         pollInterval: nextPollInterval,
                         lastReading: data.lastReading,
+                        readings: data.readings,
                         delay: data.pollInterval,
                         sessionCapture: sessionCapture,
                         resetRetries: false
@@ -221,6 +223,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                         now: now,
                         readingDate: lastDate,
                         reading: data.lastReading,
+                        readings: data.readings,
                         sessionCapture: sessionCapture
                     )
                 }
@@ -277,6 +280,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 data: updatedData,
                 pollInterval: nextPollInterval,
                 lastReading: data.lastReading,
+                readings: data.readings,
                 delay: delay,
                 sessionCapture: sessionCapture,
                 resetRetries: false
@@ -306,6 +310,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 data: updatedData,
                 pollInterval: nextPollInterval,
                 lastReading: data.lastReading,
+                readings: data.readings,
                 delay: data.pollInterval,
                 sessionCapture: sessionCapture,
                 resetRetries: false
@@ -326,6 +331,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         now: Date,
         readingDate: Date,
         reading: GlucoseReading?,
+        readings: [GlucoseReading]?,
         sessionCapture: SessionCapture
     ) async {
         let timeSinceReading = now.timeIntervalSince(readingDate)
@@ -336,6 +342,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             data: data,
             pollInterval: Self.minInterval,
             lastReading: reading,
+            readings: readings,
             delay: delay,
             sessionCapture: sessionCapture,
             resetRetries: true
@@ -347,6 +354,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         data: LiveActivityData,
         pollInterval: TimeInterval,
         lastReading: GlucoseReading?,
+        readings: [GlucoseReading]?,
         delay: TimeInterval,
         sessionCapture: SessionCapture,
         resetRetries: Bool
@@ -355,6 +363,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         updatedData.pollInterval = pollInterval
         updatedData.lastReading = lastReading
         updatedData.lastReadingDate = lastReading?.date
+        updatedData.readings = readings
         updatedData.accountID = sessionCapture.accountID ?? data.accountID
         updatedData.sessionID = sessionCapture.sessionID ?? data.sessionID
         if resetRetries {
@@ -478,6 +487,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             now: now,
             readingDate: latestReading.date,
             reading: latestReading,
+            readings: readings,
             sessionCapture: sessionCapture
         )
     }
