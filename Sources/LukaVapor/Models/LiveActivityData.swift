@@ -26,6 +26,7 @@ struct LiveActivityData: Codable, Sendable {
     // Polling state (mutable)
     var lastReadingDate: Date?
     var lastReading: GlucoseReading?
+    var readings: [GlucoseReading]?
     var pollInterval: TimeInterval
     var retryCount: Int
 
