@@ -121,6 +121,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             // Load activity data from hash
             guard let data = try await loadActivityData(app: app, id: id) else {
                 // Activity was deleted, remove from schedule
+                app.logger.info("🗑️ Activity \(id.prefix(8))... data not found, removing from schedule")
                 await removeFromSchedule(app: app, id: id)
                 return
             }
