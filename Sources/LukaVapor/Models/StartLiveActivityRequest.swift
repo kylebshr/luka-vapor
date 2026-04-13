@@ -22,8 +22,8 @@ struct LiveActivityPreferences: Codable {
 struct StartLiveActivityRequest: Codable, Sendable {
     var pushToken: LiveActivityPushToken
     var environment: PushEnvironment
-    var username: String?
-    var password: String?
+    var username: String
+    var password: String
     var accountID: UUID?
     var sessionID: UUID?
     var accountLocation: AccountLocation
@@ -33,24 +33,17 @@ struct StartLiveActivityRequest: Codable, Sendable {
 
 extension StartLiveActivityRequest {
     var logID: String {
-        if let username {
-            let parts = username.split(separator: "@", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { return String(username.prefix(4)) }  // not a valid email
+        let parts = username.split(separator: "@", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return String(username.prefix(4)) }
 
-            let local = parts[0]
-            let domain = parts[1]
+        let local = parts[0]
+        let domain = parts[1]
 
-            // Keep first character, replace the rest (if any) with dots
-            guard let firstChar = local.first else { return String(username.prefix(4)) }
+        guard let firstChar = local.first else { return String(username.prefix(4)) }
 
-            let redactionCount = max(local.count - 1, 0)
-            let redaction = String(repeating: "•", count: redactionCount)
+        let redactionCount = max(local.count - 1, 0)
+        let redaction = String(repeating: "•", count: redactionCount)
 
-            return "\(firstChar)\(redaction)@\(domain)"
-        } else if let accountID {
-            return String(accountID.uuidString.prefix(4))
-        } else {
-            return "n/a"
-        }
+        return "\(firstChar)\(redaction)@\(domain)"
     }
 }
