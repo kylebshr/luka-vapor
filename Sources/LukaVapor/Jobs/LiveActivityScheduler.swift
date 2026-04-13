@@ -137,33 +137,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     }
 
     private func pollAndUpdate(app: Application, session: inout LiveActivityPollSession, now: Date) async {
-        // Check if we should send stale updates (before fetching, so we send even if fetch fails)
-        if let lastReadingDate = session.lastReadingDate, let lastReading = session.lastReading {
-            let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
-            if timeSinceLastReading >= Self.readingInterval {
-                let staleMinutes = Int(timeSinceLastReading / 60)
-                let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
-
-                if let milestone, session.lastStaleUpdateMinutes != milestone {
-                    app.logger.info("📡 \(session.logID) Sending stale update at \(milestone) minutes")
-                    session.lastStaleUpdateMinutes = milestone
-
-                    let readings = session.readings ?? [lastReading]
-                    // Send stale updates only to tokens that opted in
-                    for token in session.tokens where token.preferences?.sendStaleUpdates == true {
-                        await sendStaleUpdate(
-                            app: app,
-                            pushToken: token.pushToken,
-                            environment: token.environment,
-                            readings: readings,
-                            latestReading: lastReading,
-                            logID: session.logID
-                        )
-                    }
-                }
-            }
-        }
-
         let sessionCapture = SessionCapture()
         let client = DexcomClient(
             username: session.username,
@@ -184,6 +157,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             guard let latestReading = readings.last else {
                 app.logger.warning("🛑 \(session.logID) No readings available")
+                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
                 let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
                 await reschedule(
                     app: app,
@@ -201,6 +175,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             // Check if we have a new reading
             if let lastDate = session.lastReadingDate, latestReading.date <= lastDate {
                 let timeSinceLastReading = now.timeIntervalSince(lastDate)
+
+                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
 
                 if timeSinceLastReading >= Self.readingInterval {
                     // Reading is overdue - poll with backoff
@@ -249,6 +225,36 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             await handleDecodingError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
         } catch {
             await handleGenericError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
+        }
+    }
+
+    // MARK: - Stale Updates
+
+    /// Sends stale milestone updates (at 5 and 10 minutes) when no new reading is available.
+    private func sendStaleUpdatesIfNeeded(app: Application, session: inout LiveActivityPollSession, now: Date) async {
+        guard let lastReadingDate = session.lastReadingDate, let lastReading = session.lastReading else { return }
+
+        let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
+        guard timeSinceLastReading >= Self.readingInterval else { return }
+
+        let staleMinutes = Int(timeSinceLastReading / 60)
+        let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
+
+        guard let milestone, session.lastStaleUpdateMinutes != milestone else { return }
+
+        app.logger.info("📡 \(session.logID) Sending stale update at \(milestone) minutes")
+        session.lastStaleUpdateMinutes = milestone
+
+        let readings = session.readings ?? [lastReading]
+        for token in session.tokens {
+            await sendStaleUpdate(
+                app: app,
+                pushToken: token.pushToken,
+                environment: token.environment,
+                readings: readings,
+                latestReading: lastReading,
+                logID: session.logID
+            )
         }
     }
 
