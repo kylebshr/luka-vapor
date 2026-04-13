@@ -31,18 +31,5 @@ struct StartLiveActivityRequest: Codable, Sendable {
 }
 
 extension StartLiveActivityRequest {
-    var logID: String {
-        let parts = username.split(separator: "@", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return String(username.prefix(4)) }
-
-        let local = parts[0]
-        let domain = parts[1]
-
-        guard let firstChar = local.first else { return String(username.prefix(4)) }
-
-        let redactionCount = max(local.count - 1, 0)
-        let redaction = String(repeating: "•", count: redactionCount)
-
-        return "\(firstChar)\(redaction)@\(domain)"
-    }
+    var logID: String { username.redactedEmailLogID }
 }

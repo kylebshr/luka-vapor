@@ -1,7 +1,4 @@
 import Vapor
-import Dexcom
-import APNS
-import Queues
 import Redis
 
 func routes(_ app: Application) throws {
@@ -23,25 +20,8 @@ func routes(_ app: Application) throws {
         var session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
         // Send end event to the token being removed
-        let apnsClient = switch body.pushToken.environment(from: session) {
-        case .development: await app.apns.client(.development)
-        case .production: await app.apns.client(.production)
-        }
-
-        _ = try? await apnsClient.sendLiveActivityNotification(
-            .init(
-                expiration: .none,
-                priority: .immediately,
-                appID: "com.kylebashour.Glimpse",
-                contentState: LiveActivityState(c: nil, h: [], se: true),
-                event: .end,
-                timestamp: Int(Date.now.timeIntervalSince1970),
-                dismissalDate: .none,
-                staleDate: nil,
-                apnsID: nil
-            ),
-            deviceToken: body.pushToken.rawValue
-        )
+        let environment = session.tokens.first { $0.pushToken == body.pushToken }?.environment ?? .production
+        await LiveActivityScheduler.sendEndEvent(app: app, pushToken: body.pushToken, environment: environment)
 
         // Remove the matching token
         session.tokens.removeAll { $0.pushToken == body.pushToken }
@@ -130,12 +110,5 @@ func routes(_ app: Application) throws {
         }
 
         return .ok
-    }
-}
-
-// Helper to look up the environment for a push token from its session
-private extension LiveActivityPushToken {
-    func environment(from session: LiveActivityPollSession) -> PushEnvironment {
-        session.tokens.first { $0.pushToken == self }?.environment ?? .production
     }
 }

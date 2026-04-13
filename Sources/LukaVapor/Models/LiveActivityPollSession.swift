@@ -31,14 +31,19 @@ struct LiveActivityPollSession: Codable, Sendable {
 }
 
 extension LiveActivityPollSession {
-    var logID: String {
-        let parts = username.split(separator: "@", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return String(username.prefix(4)) }
+    var logID: String { username.redactedEmailLogID }
+}
+
+extension String {
+    /// Redacts an email for logging: "kyle@example.com" → "k•••@example.com"
+    var redactedEmailLogID: String {
+        let parts = split(separator: "@", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return String(prefix(4)) }
 
         let local = parts[0]
         let domain = parts[1]
 
-        guard let firstChar = local.first else { return String(username.prefix(4)) }
+        guard let firstChar = local.first else { return String(prefix(4)) }
 
         let redactionCount = max(local.count - 1, 0)
         let redaction = String(repeating: "•", count: redactionCount)

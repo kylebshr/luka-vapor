@@ -27,12 +27,15 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Each session represents one Dexcom username with one or more device tokens.
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
+    static let appBundleID = "com.kylebashour.Glimpse"
     static let minInterval: TimeInterval = 4
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
+    static let decodingErrorRetryLimit = 5
+    static let genericErrorRetryLimit = 3
 
     func run(context: QueueContext) async throws {
         let app = context.application
@@ -119,7 +122,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             for token in expiredTokens {
                 app.logger.info("🕟 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... reached max duration")
-                await sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+                await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
             }
 
             if session.tokens.isEmpty {
@@ -270,7 +273,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let statusCode = error.statusCode?.description ?? "unknown"
         app.logger.error("🚫 \(session.logID) DexcomDecodingError status: \(statusCode) body: \(bodyString)")
 
-        if session.pollInterval >= Self.maxInterval && session.retryCount > 5 {
+        if session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit {
             app.logger.error("🤬 \(session.logID) Done retrying due to errors, ending all tokens")
             await endAllTokens(app: app, session: session, reason: .tooManyRetries)
         } else {
@@ -300,7 +303,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     ) async {
         app.logger.error("🚫 \(session.logID) Error polling for session: \(error)")
 
-        if session.pollInterval >= Self.maxInterval && session.retryCount >= 3 {
+        if session.pollInterval >= Self.maxInterval && session.retryCount >= Self.genericErrorRetryLimit {
             app.logger.error("🤬 \(session.logID) Done retrying due to errors, ending all tokens")
             await endAllTokens(app: app, session: session, reason: .tooManyRetries)
         } else {
@@ -403,7 +406,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// Ends all tokens in a session and cleans up.
     private func endAllTokens(app: Application, session: LiveActivityPollSession, reason: EndReason) async {
         for token in session.tokens {
-            await sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+            await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
         }
 
         await removeSession(app: app, username: session.username)
@@ -494,7 +497,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             .init(
                 expiration: .timeIntervalSince1970InSeconds(staleDate),
                 priority: .immediately,
-                appID: "com.kylebashour.Glimpse",
+                appID: Self.appBundleID,
                 contentState: state,
                 event: .update,
                 alert: alert,
@@ -529,7 +532,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         }
     }
 
-    private func sendEndEvent(app: Application, pushToken: LiveActivityPushToken, environment: PushEnvironment) async {
+    static func sendEndEvent(app: Application, pushToken: LiveActivityPushToken, environment: PushEnvironment) async {
         let apnsClient = switch environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
@@ -539,7 +542,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             .init(
                 expiration: .none,
                 priority: .immediately,
-                appID: "com.kylebashour.Glimpse",
+                appID: appBundleID,
                 contentState: LiveActivityState(c: nil, h: [], se: true),
                 event: .end,
                 timestamp: Int(Date.now.timeIntervalSince1970),
