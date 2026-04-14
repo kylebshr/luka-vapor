@@ -1,7 +1,4 @@
 import Vapor
-import Dexcom
-import APNS
-import Queues
 import Redis
 
 func routes(_ app: Application) throws {
@@ -12,24 +9,37 @@ func routes(_ app: Application) throws {
     app.post("end-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivityRequest.self)
 
-        // Determine activity ID from request
-        let activityID: String
-        if let username = body.username {
-            activityID = username
-        } else if let pushToken = body.pushToken {
-            activityID = pushToken.rawValue
-        } else {
-            req.logger.error("Must provide username or pushToken")
-            throw Abort(.badRequest, reason: "Must provide username or pushToken")
+        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
+
+        // Load existing session
+        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get() else {
+            req.logger.warning("⏹️  No session found for \(body.username.prefix(8))...")
+            return .ok
         }
 
-        // Remove from schedule sorted set
-        _ = try await req.redis.zrem(activityID, from: LiveActivityKeys.scheduleKey).get()
+        var session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
-        // Delete activity data hash
-        _ = try await req.redis.delete(LiveActivityKeys.dataKey(for: activityID)).get()
+        // Send end event to the token being removed
+        let environment = session.tokens.first { $0.pushToken == body.pushToken }?.environment ?? .production
+        await LiveActivityScheduler.sendEndEvent(app: app, pushToken: body.pushToken, environment: environment)
 
-        req.logger.info("⏹️  Ended Live Activity for \(activityID.prefix(8))...")
+        // Remove the matching token
+        session.tokens.removeAll { $0.pushToken == body.pushToken }
+
+        if session.tokens.isEmpty {
+            // No tokens left — clean up entirely
+            _ = try await req.redis.zrem(body.username, from: LiveActivityPollKeys.scheduleKey).get()
+            _ = try await req.redis.delete(dataKey).get()
+            req.logger.info("⏹️  \(session.logID) Ended last token, removed session")
+        } else {
+            // Save updated session
+            let jsonData = try JSONEncoder().encode(session)
+            guard let updatedJSON = String(data: jsonData, encoding: .utf8) else {
+                throw Abort(.internalServerError, reason: "Failed to encode session data")
+            }
+            _ = try await req.redis.hset("data", to: updatedJSON, in: dataKey).get()
+            req.logger.info("⏹️  \(session.logID) Removed token, \(session.tokens.count) remaining")
+        }
 
         return .ok
     }
@@ -37,43 +47,67 @@ func routes(_ app: Application) throws {
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        let activityID = LiveActivityData.makeID(username: body.username, pushToken: body.pushToken)
+        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
 
-        // Create activity data
-        let data = LiveActivityData(
-            id: activityID,
+        let tokenEntry = LiveActivityTokenEntry(
             pushToken: body.pushToken,
             environment: body.environment,
-            accountLocation: body.accountLocation,
-            duration: body.duration,
-            username: body.username,
-            password: body.password,
-            accountID: body.accountID,
-            sessionID: body.sessionID,
             preferences: body.preferences,
             startDate: Date.now,
-            lastReadingDate: nil,
-            lastReading: nil,
-            pollInterval: LiveActivityScheduler.minInterval,
-            retryCount: 0
+            duration: body.duration
         )
 
-        // Store in Redis hash
-        let dataKey = LiveActivityKeys.dataKey(for: activityID)
-        let jsonData = try JSONEncoder().encode(data)
-        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-            throw Abort(.internalServerError, reason: "Failed to encode activity data")
+        // Try to load an existing session for this username
+        if let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
+           var session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)) {
+
+            // Replace existing token entry or append new one
+            if let index = session.tokens.firstIndex(where: { $0.pushToken == body.pushToken }) {
+                session.tokens[index] = tokenEntry
+            } else {
+                session.tokens.append(tokenEntry)
+            }
+
+            // Update credentials to latest
+            session.password = body.password
+            session.accountID = body.accountID ?? session.accountID
+            session.sessionID = body.sessionID ?? session.sessionID
+
+            let jsonData = try JSONEncoder().encode(session)
+            guard let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                throw Abort(.internalServerError, reason: "Failed to encode session data")
+            }
+            _ = try await req.redis.hset("data", to: jsonStr, in: dataKey).get()
+
+            req.logger.info("🆕 \(body.logID) Added token to existing session (\(session.tokens.count) tokens)")
+        } else {
+            // Create new session
+            let session = LiveActivityPollSession(
+                username: body.username,
+                password: body.password,
+                accountID: body.accountID,
+                sessionID: body.sessionID,
+                accountLocation: body.accountLocation,
+                tokens: [tokenEntry],
+                pollInterval: LiveActivityScheduler.minInterval,
+                retryCount: 0
+            )
+
+            let jsonData = try JSONEncoder().encode(session)
+            guard let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                throw Abort(.internalServerError, reason: "Failed to encode session data")
+            }
+            _ = try await req.redis.hset("data", to: jsonStr, in: dataKey).get()
+
+            // Add to schedule sorted set (immediate execution)
+            let nowTimestamp = Date.now.timeIntervalSince1970
+            _ = try await req.redis.zadd(
+                (element: body.username, score: nowTimestamp),
+                to: LiveActivityPollKeys.scheduleKey
+            ).get()
+
+            req.logger.info("🆕 \(body.logID) Started new Live Activity session")
         }
-        _ = try await req.redis.hset("data", to: jsonString, in: dataKey).get()
-
-        // Add to schedule sorted set (immediate execution)
-        let nowTimestamp = Date.now.timeIntervalSince1970
-        _ = try await req.redis.zadd(
-            (element: activityID, score: nowTimestamp),
-            to: LiveActivityKeys.scheduleKey
-        ).get()
-
-        req.logger.info("🆕 \(body.logID) Started Live Activity polling")
 
         return .ok
     }

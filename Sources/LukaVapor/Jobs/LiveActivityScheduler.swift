@@ -23,175 +23,152 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
     }
 }
 
-/// Redis key helpers for live activity storage
-enum LiveActivityKeys {
-    static let scheduleKey = RedisKey("live-activities:schedule")
-
-    static func dataKey(for id: String) -> RedisKey {
-        RedisKey("live-activity:data:\(id)")
-    }
-}
-
-/// A scheduled job that runs every second to process due live activities.
-/// Uses Redis sorted set for scheduling and hash for activity data.
+/// A scheduled job that runs every second to process due live activity poll sessions.
+/// Each session represents one Dexcom username with one or more device tokens.
+/// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
+    static let appBundleID = "com.kylebashour.Glimpse"
     static let minInterval: TimeInterval = 4
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
-    static let maximumDuration: TimeInterval = 60 * 60 * 6 // 6h - longer activities often fail to receive end updates
+    static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
+    static let decodingErrorRetryLimit = 5
+    static let genericErrorRetryLimit = 3
 
     func run(context: QueueContext) async throws {
         let app = context.application
         let now = Date()
         let nowTimestamp = now.timeIntervalSince1970
 
-        // Query Redis sorted set for all activities due now or earlier
-        let dueActivities = try await getDueActivities(app: app, beforeTimestamp: nowTimestamp)
+        let dueSessions = try await getDueSessions(app: app, beforeTimestamp: nowTimestamp)
 
-        guard !dueActivities.isEmpty else { return }
+        guard !dueSessions.isEmpty else { return }
 
-        context.logger.info("📥 Dequeued activities (\(dueActivities.count))")
+        context.logger.info("📥 Dequeued sessions (\(dueSessions.count))")
 
-        for activityID in dueActivities {
-            await processActivity(id: activityID, app: app, now: now)
+        for username in dueSessions {
+            await processSession(username: username, app: app, now: now)
             try? await Task.sleep(for: .milliseconds(300))
         }
     }
 
     // MARK: - Redis Operations
 
-    /// Queries for activities due for processing and immediately bumps their scores
+    /// Queries for sessions due for processing and immediately bumps their scores
     /// to prevent re-pickup by subsequent scheduler runs.
-    ///
-    /// We bump scores rather than removing entries because if processing crashes
-    /// before `reschedule()` is called, the activity will still be retried after
-    /// `maxInterval` seconds. Removing would orphan the activity permanently.
-    private func getDueActivities(app: Application, beforeTimestamp: Double) async throws -> [String] {
+    private func getDueSessions(app: Application, beforeTimestamp: Double) async throws -> [String] {
         let results = try await app.redis.zrangebyscore(
-            from: LiveActivityKeys.scheduleKey,
+            from: LiveActivityPollKeys.scheduleKey,
             withScoresBetween: (.inclusive(-.infinity), .inclusive(beforeTimestamp))
         ).get()
 
-        let activityIDs = results.compactMap { String(fromRESP: $0) }
+        let usernames = results.compactMap { String(fromRESP: $0) }
 
         // Bump scores to prevent re-pickup while processing.
-        // Each activity will set its real next time via reschedule().
         let processingTimestamp = beforeTimestamp + Self.maxInterval
-        for activityID in activityIDs {
+        for username in usernames {
             _ = try? await app.redis.zadd(
-                (element: activityID, score: processingTimestamp),
-                to: LiveActivityKeys.scheduleKey
+                (element: username, score: processingTimestamp),
+                to: LiveActivityPollKeys.scheduleKey
             ).get()
         }
 
-        return activityIDs
+        return usernames
     }
 
-    private func loadActivityData(app: Application, id: String) async throws -> LiveActivityData? {
-        let key = LiveActivityKeys.dataKey(for: id)
+    private func loadSession(app: Application, username: String) async throws -> LiveActivityPollSession? {
+        let key = LiveActivityPollKeys.dataKey(for: username)
         guard let jsonString = try await app.redis.hget("data", from: key, as: String.self).get() else {
             return nil
         }
-        return try JSONDecoder().decode(LiveActivityData.self, from: Data(jsonString.utf8))
+        return try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
     }
 
-    private func saveActivityData(app: Application, data: LiveActivityData) async throws {
-        let key = LiveActivityKeys.dataKey(for: data.id)
-        let jsonData = try JSONEncoder().encode(data)
+    private func saveSession(app: Application, session: LiveActivityPollSession) async throws {
+        let key = LiveActivityPollKeys.dataKey(for: session.username)
+        let jsonData = try JSONEncoder().encode(session)
         guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-            throw Abort(.internalServerError, reason: "Failed to encode activity data as JSON string")
+            throw Abort(.internalServerError, reason: "Failed to encode session data as JSON string")
         }
         _ = try await app.redis.hset("data", to: jsonString, in: key).get()
     }
 
-    private func removeFromSchedule(app: Application, id: String) async {
-        _ = try? await app.redis.zrem(id, from: LiveActivityKeys.scheduleKey).get()
+    private func removeSession(app: Application, username: String) async {
+        _ = try? await app.redis.zrem(username, from: LiveActivityPollKeys.scheduleKey).get()
+        _ = try? await app.redis.delete(LiveActivityPollKeys.dataKey(for: username)).get()
     }
 
-    private func deleteActivityData(app: Application, id: String) async {
-        _ = try? await app.redis.delete(LiveActivityKeys.dataKey(for: id)).get()
-    }
+    // MARK: - Session Processing
 
-    // MARK: - Activity Processing
-
-    private func processActivity(id: String, app: Application, now: Date) async {
+    private func processSession(username: String, app: Application, now: Date) async {
         do {
-            // Load activity data from hash
-            guard let data = try await loadActivityData(app: app, id: id) else {
-                // Activity was deleted, remove from schedule
-                app.logger.info("🗑️ Activity \(id.prefix(8))... data not found, removing from schedule")
-                await removeFromSchedule(app: app, id: id)
+            guard var session = try await loadSession(app: app, username: username) else {
+                app.logger.info("🗑️ Session \(username.prefix(8))... data not found, removing from schedule")
+                await removeSession(app: app, username: username)
                 return
             }
 
-            // Check max duration
-            if now.timeIntervalSince(data.startDate) >= Self.maximumDuration {
-                app.logger.info("🕟 \(data.logID) Reached maximum duration, ending live activity")
-                await endActivity(app: app, data: data, reason: .maxDuration)
+            // 1. Per-token expiry: remove tokens past maximumDuration, send end to each
+            var expiredTokens: [LiveActivityTokenEntry] = []
+            session.tokens.removeAll { token in
+                if now.timeIntervalSince(token.startDate) >= Self.maximumDuration {
+                    expiredTokens.append(token)
+                    return true
+                }
+                return false
+            }
+
+            for token in expiredTokens {
+                app.logger.info("🕟 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... reached max duration")
+                await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+            }
+
+            if session.tokens.isEmpty {
+                app.logger.info("🛑 \(session.logID) All tokens expired, removing session")
+                await removeSession(app: app, username: username)
                 return
             }
 
-            // Poll Dexcom and process result
-            await pollAndUpdate(app: app, data: data, now: now)
+            // 2. Poll Dexcom and process result
+            await pollAndUpdate(app: app, session: &session, now: now)
 
         } catch {
-            app.logger.error("Error processing activity \(id): \(error)")
+            app.logger.error("Error processing session \(username.prefix(8))...: \(error)")
         }
     }
 
-    private func pollAndUpdate(app: Application, data: LiveActivityData, now: Date) async {
-        var data = data
-
-        // Check if we should send a stale update (before fetching, so we send even if fetch fails)
-        if let lastReadingDate = data.lastReadingDate, let lastReading = data.lastReading {
-            let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
-            if timeSinceLastReading >= Self.readingInterval {
-                let sendStale = data.preferences?.sendStaleUpdates == true
-                let staleMinutes = Int(timeSinceLastReading / 60)
-                let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
-
-                if sendStale, let milestone, data.lastStaleUpdateMinutes != milestone {
-                    app.logger.info("📡 \(data.logID) Sending stale update at \(milestone) minutes")
-                    data.lastStaleUpdateMinutes = milestone
-                    await sendStaleUpdate(
-                        app: app,
-                        data: data,
-                        readings: data.readings ?? [lastReading],
-                        latestReading: lastReading
-                    )
-                }
-            }
-        }
-
+    private func pollAndUpdate(app: Application, session: inout LiveActivityPollSession, now: Date) async {
         let sessionCapture = SessionCapture()
         let client = DexcomClient(
-            username: data.username,
-            password: data.password,
-            existingAccountID: data.accountID,
-            existingSessionID: data.sessionID,
-            accountLocation: data.accountLocation
+            username: session.username,
+            password: session.password,
+            existingAccountID: session.accountID,
+            existingSessionID: session.sessionID,
+            accountLocation: session.accountLocation
         )
         await client.setDelegate(sessionCapture)
 
+        let maxDuration = session.tokens.map(\.duration).max() ?? 3600
+
         do {
-            // Fetch latest readings
-            app.logger.info("🔄 \(data.logID) Checking for new readings")
+            app.logger.info("🔄 \(session.logID) Checking for new readings")
             let readings = try await client.getGlucoseReadings(
-                duration: .init(value: data.duration, unit: .seconds)
+                duration: .init(value: maxDuration, unit: .seconds)
             ).sorted { $0.date < $1.date }
 
             guard let latestReading = readings.last else {
-                app.logger.warning("🛑 \(data.logID) No readings available")
-                let nextPollInterval = min(data.pollInterval * Self.backoff, Self.maxInterval)
+                app.logger.warning("🛑 \(session.logID) No readings available")
+                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
+                let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
                 await reschedule(
                     app: app,
-                    data: data,
+                    session: &session,
                     pollInterval: nextPollInterval,
-                    lastReading: data.lastReading,
-                    readings: data.readings,
-                    delay: data.pollInterval,
+                    lastReading: session.lastReading,
+                    readings: session.readings,
+                    delay: session.pollInterval,
                     sessionCapture: sessionCapture,
                     resetRetries: true
                 )
@@ -199,20 +176,21 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             }
 
             // Check if we have a new reading
-            if let lastDate = data.lastReadingDate, latestReading.date <= lastDate {
-                // No new reading yet
+            if let lastDate = session.lastReadingDate, latestReading.date <= lastDate {
                 let timeSinceLastReading = now.timeIntervalSince(lastDate)
+
+                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
 
                 if timeSinceLastReading >= Self.readingInterval {
                     // Reading is overdue - poll with backoff
-                    let nextPollInterval = min(data.pollInterval * Self.backoff, Self.maxInterval)
+                    let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
                     await reschedule(
                         app: app,
-                        data: data,
+                        session: &session,
                         pollInterval: nextPollInterval,
-                        lastReading: data.lastReading,
-                        readings: data.readings,
-                        delay: data.pollInterval,
+                        lastReading: session.lastReading,
+                        readings: session.readings,
+                        delay: session.pollInterval,
                         sessionCapture: sessionCapture,
                         resetRetries: false
                     )
@@ -220,23 +198,23 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     // Still within normal reading window, wait for next expected reading
                     await scheduleForNextReading(
                         app: app,
-                        data: data,
+                        session: &session,
                         now: now,
                         readingDate: lastDate,
-                        reading: data.lastReading,
-                        readings: data.readings,
+                        reading: session.lastReading,
+                        readings: session.readings,
                         sessionCapture: sessionCapture
                     )
                 }
                 return
             }
 
-            app.logger.info("✅ \(data.logID) New reading available - sending push")
+            app.logger.info("✅ \(session.logID) New reading available - sending push to \(session.tokens.count) token(s)")
 
-            // Send push notification and schedule next poll (or end activity on fatal APNS error)
-            await sendUpdateAndScheduleNext(
+            // Fan out APNS to all tokens
+            await fanOutUpdate(
                 app: app,
-                data: data,
+                session: &session,
                 now: now,
                 readings: readings,
                 latestReading: latestReading,
@@ -244,13 +222,42 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             )
 
         } catch let error as DexcomClientError {
-            // These errors are usually fatal.
-            app.logger.error("\(data.logID) Ending polling due to DexcomClientError: \(error)")
-            await endActivity(app: app, data: data, reason: .dexcomError)
+            app.logger.error("\(session.logID) Ending all tokens due to DexcomClientError: \(error)")
+            await endAllTokens(app: app, session: session, reason: .dexcomError)
         } catch let error as DexcomDecodingError {
-            await handleDecodingError(app: app, data: data, error: error, sessionCapture: sessionCapture)
+            await handleDecodingError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
         } catch {
-            await handleGenericError(app: app, data: data, error: error, sessionCapture: sessionCapture)
+            await handleGenericError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
+        }
+    }
+
+    // MARK: - Stale Updates
+
+    /// Sends stale milestone updates (at 5 and 10 minutes) when no new reading is available.
+    private func sendStaleUpdatesIfNeeded(app: Application, session: inout LiveActivityPollSession, now: Date) async {
+        guard let lastReadingDate = session.lastReadingDate, let lastReading = session.lastReading else { return }
+
+        let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
+        guard timeSinceLastReading >= Self.readingInterval else { return }
+
+        let staleMinutes = Int(timeSinceLastReading / 60)
+        let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
+
+        guard let milestone, session.lastStaleUpdateMinutes != milestone else { return }
+
+        app.logger.info("📡 \(session.logID) Sending stale update at \(milestone) minutes")
+        session.lastStaleUpdateMinutes = milestone
+
+        let readings = session.readings ?? [lastReading]
+        for token in session.tokens {
+            await sendStaleUpdate(
+                app: app,
+                pushToken: token.pushToken,
+                environment: token.environment,
+                readings: readings,
+                latestReading: lastReading,
+                logID: session.logID
+            )
         }
     }
 
@@ -258,30 +265,29 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func handleDecodingError(
         app: Application,
-        data: LiveActivityData,
+        session: inout LiveActivityPollSession,
         error: DexcomDecodingError,
         sessionCapture: SessionCapture
     ) async {
         let bodyString = String(data: error.body, encoding: .utf8) ?? "<non-utf8 data, \(error.body.count) bytes>"
         let statusCode = error.statusCode?.description ?? "unknown"
-        app.logger.error("🚫 \(data.logID) DexcomDecodingError status: \(statusCode) body: \(bodyString)")
+        app.logger.error("🚫 \(session.logID) DexcomDecodingError status: \(statusCode) body: \(bodyString)")
 
-        if data.pollInterval >= Self.maxInterval && data.retryCount > 5 {
-            app.logger.error("🤬 \(data.logID) Done retrying due to errors, ending activity")
-            await endActivity(app: app, data: data, reason: .tooManyRetries)
+        if session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit {
+            app.logger.error("🤬 \(session.logID) Done retrying due to errors, ending all tokens")
+            await endAllTokens(app: app, session: session, reason: .tooManyRetries)
         } else {
-            let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
-            let delay = error.statusCode == 429 ? 60 + jitter() : data.pollInterval // wait a whole minute after a 429
+            let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
+            let delay = error.statusCode == 429 ? 60 + jitter() : session.pollInterval
 
-            var updatedData = data
-            updatedData.retryCount += 1
+            session.retryCount += 1
 
             await reschedule(
                 app: app,
-                data: updatedData,
+                session: &session,
                 pollInterval: nextPollInterval,
-                lastReading: data.lastReading,
-                readings: data.readings,
+                lastReading: session.lastReading,
+                readings: session.readings,
                 delay: delay,
                 sessionCapture: sessionCapture,
                 resetRetries: false
@@ -291,28 +297,27 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func handleGenericError(
         app: Application,
-        data: LiveActivityData,
+        session: inout LiveActivityPollSession,
         error: any Error,
         sessionCapture: SessionCapture
     ) async {
-        app.logger.error("🚫 \(data.logID) Error polling for session: \(error)")
+        app.logger.error("🚫 \(session.logID) Error polling for session: \(error)")
 
-        if data.pollInterval >= Self.maxInterval && data.retryCount >= 3 {
-            app.logger.error("🤬 \(data.logID) Done retrying due to errors, ending activity")
-            await endActivity(app: app, data: data, reason: .tooManyRetries)
+        if session.pollInterval >= Self.maxInterval && session.retryCount >= Self.genericErrorRetryLimit {
+            app.logger.error("🤬 \(session.logID) Done retrying due to errors, ending all tokens")
+            await endAllTokens(app: app, session: session, reason: .tooManyRetries)
         } else {
-            let nextPollInterval = min(data.pollInterval * Self.errorBackoff, Self.maxInterval)
+            let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
 
-            var updatedData = data
-            updatedData.retryCount += 1
+            session.retryCount += 1
 
             await reschedule(
                 app: app,
-                data: updatedData,
+                session: &session,
                 pollInterval: nextPollInterval,
-                lastReading: data.lastReading,
-                readings: data.readings,
-                delay: data.pollInterval,
+                lastReading: session.lastReading,
+                readings: session.readings,
+                delay: session.pollInterval,
                 sessionCapture: sessionCapture,
                 resetRetries: false
             )
@@ -325,10 +330,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     // MARK: - Scheduling
 
-    /// Schedules the next poll based on when the next Dexcom reading is expected.
     private func scheduleForNextReading(
         app: Application,
-        data: LiveActivityData,
+        session: inout LiveActivityPollSession,
         now: Date,
         readingDate: Date,
         reading: GlucoseReading?,
@@ -340,7 +344,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let delay = timeUntilNextReading + 10 // give 10s to try to ensure reading is ready
         await reschedule(
             app: app,
-            data: data,
+            session: &session,
             pollInterval: Self.minInterval,
             lastReading: reading,
             readings: readings,
@@ -352,7 +356,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func reschedule(
         app: Application,
-        data: LiveActivityData,
+        session: inout LiveActivityPollSession,
         pollInterval: TimeInterval,
         lastReading: GlucoseReading?,
         readings: [GlucoseReading]?,
@@ -360,36 +364,33 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         sessionCapture: SessionCapture,
         resetRetries: Bool
     ) async {
-        var updatedData = data
-        updatedData.pollInterval = pollInterval
-        updatedData.lastReading = lastReading
-        updatedData.lastReadingDate = lastReading?.date
-        updatedData.readings = readings
-        updatedData.accountID = sessionCapture.accountID ?? data.accountID
-        updatedData.sessionID = sessionCapture.sessionID ?? data.sessionID
+        session.pollInterval = pollInterval
+        session.lastReading = lastReading
+        session.lastReadingDate = lastReading?.date
+        session.readings = readings
+        session.accountID = sessionCapture.accountID ?? session.accountID
+        session.sessionID = sessionCapture.sessionID ?? session.sessionID
         if resetRetries {
-            updatedData.retryCount = 0
-            updatedData.lastStaleUpdateMinutes = nil
+            session.retryCount = 0
+            session.lastStaleUpdateMinutes = nil
         }
 
         let nextTimestamp = Date().addingTimeInterval(delay).timeIntervalSince1970
 
         do {
-            // Update data hash
-            try await saveActivityData(app: app, data: updatedData)
+            try await saveSession(app: app, session: session)
 
-            // Update schedule sorted set
             _ = try await app.redis.zadd(
-                (element: data.id, score: nextTimestamp),
-                to: LiveActivityKeys.scheduleKey
+                (element: session.username, score: nextTimestamp),
+                to: LiveActivityPollKeys.scheduleKey
             ).get()
 
             let scheduledTime = Date(timeIntervalSince1970: nextTimestamp)
                 .formatted(.dateTime.hour().minute().second())
             let formattedDelay = Duration.seconds(delay).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .abbreviated))
-            app.logger.info("😴 \(data.logID) Scheduled for \(scheduledTime) (in \(formattedDelay))")
+            app.logger.info("😴 \(session.logID) Scheduled for \(scheduledTime) (in \(formattedDelay))")
         } catch {
-            app.logger.error("Failed to reschedule \(data.logID): \(error)")
+            app.logger.error("Failed to reschedule \(session.logID): \(error)")
         }
     }
 
@@ -399,34 +400,89 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         case maxDuration
         case dexcomError
         case apnsInvalidToken
-        case manualStop
         case tooManyRetries
     }
 
-    private func endActivity(app: Application, data: LiveActivityData, reason: EndReason) async {
-        // Send end event
-        await sendEndEvent(app: app, data: data)
+    /// Ends all tokens in a session and cleans up.
+    private func endAllTokens(app: Application, session: LiveActivityPollSession, reason: EndReason) async {
+        for token in session.tokens {
+            await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+        }
 
-        // Remove from schedule
-        await removeFromSchedule(app: app, id: data.id)
+        await removeSession(app: app, username: session.username)
 
-        // Delete data hash
-        await deleteActivityData(app: app, id: data.id)
-
-        app.logger.info("🛑 \(data.logID) Activity ended: \(reason.rawValue)")
+        app.logger.info("🛑 \(session.logID) Session ended (\(session.tokens.count) tokens): \(reason.rawValue)")
     }
 
     // MARK: - APNS
 
-    /// Sends a live activity update notification.
+    /// Fan out a reading update to all tokens. Removes tokens that get fatal APNS errors.
+    private func fanOutUpdate(
+        app: Application,
+        session: inout LiveActivityPollSession,
+        now: Date,
+        readings: [GlucoseReading],
+        latestReading: GlucoseReading,
+        sessionCapture: SessionCapture
+    ) async {
+        var tokensToRemove: Set<LiveActivityPushToken> = []
+
+        for token in session.tokens {
+            let alertContent = alert(for: latestReading, lastReading: session.lastReading, preferences: token.preferences)
+            do {
+                try await sendActivityPush(
+                    app: app,
+                    pushToken: token.pushToken,
+                    environment: token.environment,
+                    readings: readings,
+                    latestReading: latestReading,
+                    alert: alertContent
+                )
+                app.logger.info("🚚 \(session.logID) Sent push to \(token.pushToken.rawValue.prefix(8))...")
+            } catch let error as APNSCore.APNSError {
+                app.logger.error("\(session.logID) APNS error for \(token.pushToken.rawValue.prefix(8))...: \(error)")
+                if let reason = error.reason,
+                   reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
+                    app.logger.error("\(session.logID) Removing token \(token.pushToken.rawValue.prefix(8))... due to \(reason.reason)")
+                    tokensToRemove.insert(token.pushToken)
+                }
+            } catch {
+                app.logger.error("\(session.logID) Unexpected error sending push to \(token.pushToken.rawValue.prefix(8))...: \(error)")
+            }
+        }
+
+        // Remove invalid tokens
+        if !tokensToRemove.isEmpty {
+            session.tokens.removeAll { tokensToRemove.contains($0.pushToken) }
+        }
+
+        if session.tokens.isEmpty {
+            app.logger.info("🛑 \(session.logID) All tokens invalid, removing session")
+            await removeSession(app: app, username: session.username)
+            return
+        }
+
+        // Schedule next poll
+        await scheduleForNextReading(
+            app: app,
+            session: &session,
+            now: now,
+            readingDate: latestReading.date,
+            reading: latestReading,
+            readings: readings,
+            sessionCapture: sessionCapture
+        )
+    }
+
     private func sendActivityPush(
         app: Application,
-        data: LiveActivityData,
+        pushToken: LiveActivityPushToken,
+        environment: PushEnvironment,
         readings: [GlucoseReading],
         latestReading: GlucoseReading,
         alert: APNSAlertNotificationContent? = nil
     ) async throws {
-        let apnsClient = switch data.environment {
+        let apnsClient = switch environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
         }
@@ -441,7 +497,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             .init(
                 expiration: .timeIntervalSince1970InSeconds(staleDate),
                 priority: .immediately,
-                appID: "com.kylebashour.Glimpse",
+                appID: Self.appBundleID,
                 contentState: state,
                 event: .update,
                 alert: alert,
@@ -450,66 +506,34 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 staleDate: staleDate,
                 apnsID: nil
             ),
-            deviceToken: data.pushToken.rawValue
+            deviceToken: pushToken.rawValue
         )
     }
 
-    /// Sends a live activity update and schedules the next poll.
-    /// On fatal APNS error (invalid token), ends the activity instead of scheduling.
-    private func sendUpdateAndScheduleNext(
-        app: Application,
-        data: LiveActivityData,
-        now: Date,
-        readings: [GlucoseReading],
-        latestReading: GlucoseReading,
-        sessionCapture: SessionCapture
-    ) async {
-        do {
-            let alertContent = alert(for: latestReading, lastReading: data.lastReading, preferences: data.preferences)
-            try await sendActivityPush(app: app, data: data, readings: readings, latestReading: latestReading, alert: alertContent)
-            app.logger.info("🚚 \(data.logID) Sent Live Activity push to \(data.pushToken.rawValue.prefix(8))")
-        } catch let error as APNSCore.APNSError {
-            app.logger.error("\(data.logID) APNS error: \(error)")
-            if let reason = error.reason {
-                if reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
-                    app.logger.error("\(data.logID) Live Activity ended because \(reason.reason), stopping polling")
-                    await endActivity(app: app, data: data, reason: .apnsInvalidToken)
-                    return
-                }
-            }
-        } catch {
-            app.logger.error("\(data.logID) Unexpected error sending push: \(error)")
-        }
-
-        // Schedule next poll
-        await scheduleForNextReading(
-            app: app,
-            data: data,
-            now: now,
-            readingDate: latestReading.date,
-            reading: latestReading,
-            readings: readings,
-            sessionCapture: sessionCapture
-        )
-    }
-
-    /// Sends a stale update push to refresh the Live Activity UI without a new reading.
     private func sendStaleUpdate(
         app: Application,
-        data: LiveActivityData,
+        pushToken: LiveActivityPushToken,
+        environment: PushEnvironment,
         readings: [GlucoseReading],
-        latestReading: GlucoseReading
+        latestReading: GlucoseReading,
+        logID: String
     ) async {
         do {
-            try await sendActivityPush(app: app, data: data, readings: readings, latestReading: latestReading)
-            app.logger.info("🚚 \(data.logID) Sent stale update push to \(data.pushToken.rawValue.prefix(8))")
+            try await sendActivityPush(
+                app: app,
+                pushToken: pushToken,
+                environment: environment,
+                readings: readings,
+                latestReading: latestReading
+            )
+            app.logger.info("🚚 \(logID) Sent stale update push to \(pushToken.rawValue.prefix(8))...")
         } catch {
-            app.logger.error("\(data.logID) Error sending stale update: \(error)")
+            app.logger.error("\(logID) Error sending stale update to \(pushToken.rawValue.prefix(8))...: \(error)")
         }
     }
 
-    private func sendEndEvent(app: Application, data: LiveActivityData) async {
-        let apnsClient = switch data.environment {
+    static func sendEndEvent(app: Application, pushToken: LiveActivityPushToken, environment: PushEnvironment) async {
+        let apnsClient = switch environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
         }
@@ -518,7 +542,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             .init(
                 expiration: .none,
                 priority: .immediately,
-                appID: "com.kylebashour.Glimpse",
+                appID: appBundleID,
                 contentState: LiveActivityState(c: nil, h: [], se: true),
                 event: .end,
                 timestamp: Int(Date.now.timeIntervalSince1970),
@@ -526,7 +550,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 staleDate: nil,
                 apnsID: nil
             ),
-            deviceToken: data.pushToken.rawValue
+            deviceToken: pushToken.rawValue
         )
     }
 
