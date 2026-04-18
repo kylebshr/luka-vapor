@@ -123,6 +123,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             for token in expiredTokens {
                 app.logger.info("🕟 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... reached max duration")
                 await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+                app.axiom?.emit("push_ended", attributes: [
+                    "user": session.logID,
+                    "environment": token.environment.rawValue,
+                    "token_prefix": String(token.pushToken.rawValue.prefix(8)),
+                    "reason": "max_duration",
+                ])
             }
 
             if session.tokens.isEmpty {
@@ -407,6 +413,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     private func endAllTokens(app: Application, session: LiveActivityPollSession, reason: EndReason) async {
         for token in session.tokens {
             await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+            app.axiom?.emit("push_ended", attributes: [
+                "user": session.logID,
+                "environment": token.environment.rawValue,
+                "token_prefix": String(token.pushToken.rawValue.prefix(8)),
+                "reason": reason.rawValue,
+            ])
         }
 
         await removeSession(app: app, username: session.username)
@@ -429,6 +441,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         for token in session.tokens {
             let alertContent = alert(for: latestReading, lastReading: session.lastReading, preferences: token.preferences)
+            let tokenPrefix = String(token.pushToken.rawValue.prefix(8))
             do {
                 try await sendActivityPush(
                     app: app,
@@ -438,16 +451,43 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     latestReading: latestReading,
                     alert: alertContent
                 )
-                app.logger.info("🚚 \(session.logID) Sent push to \(token.pushToken.rawValue.prefix(8))...")
+                app.logger.info("🚚 \(session.logID) Sent push to \(tokenPrefix)...")
+                app.axiom?.emit("push_sent", attributes: [
+                    "user": session.logID,
+                    "environment": token.environment.rawValue,
+                    "token_prefix": tokenPrefix,
+                    "kind": "update",
+                    "has_alert": alertContent != nil ? "true" : "false",
+                ])
             } catch let error as APNSCore.APNSError {
-                app.logger.error("\(session.logID) APNS error for \(token.pushToken.rawValue.prefix(8))...: \(error)")
+                app.logger.error("\(session.logID) APNS error for \(tokenPrefix)...: \(error)")
+                let apnsReason = error.reason?.reason ?? "unknown"
+                var willRemove = false
                 if let reason = error.reason,
                    reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
-                    app.logger.error("\(session.logID) Removing token \(token.pushToken.rawValue.prefix(8))... due to \(reason.reason)")
+                    app.logger.error("\(session.logID) Removing token \(tokenPrefix)... due to \(reason.reason)")
                     tokensToRemove.insert(token.pushToken)
+                    willRemove = true
                 }
+                app.axiom?.emit("push_failed", attributes: [
+                    "user": session.logID,
+                    "environment": token.environment.rawValue,
+                    "token_prefix": tokenPrefix,
+                    "kind": "update",
+                    "error_type": "apns",
+                    "apns_reason": apnsReason,
+                    "token_removed": willRemove ? "true" : "false",
+                ])
             } catch {
-                app.logger.error("\(session.logID) Unexpected error sending push to \(token.pushToken.rawValue.prefix(8))...: \(error)")
+                app.logger.error("\(session.logID) Unexpected error sending push to \(tokenPrefix)...: \(error)")
+                app.axiom?.emit("push_failed", attributes: [
+                    "user": session.logID,
+                    "environment": token.environment.rawValue,
+                    "token_prefix": tokenPrefix,
+                    "kind": "update",
+                    "error_type": "other",
+                    "error": String(describing: type(of: error)),
+                ])
             }
         }
 
@@ -518,6 +558,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         latestReading: GlucoseReading,
         logID: String
     ) async {
+        let tokenPrefix = String(pushToken.rawValue.prefix(8))
         do {
             try await sendActivityPush(
                 app: app,
@@ -526,9 +567,25 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 readings: readings,
                 latestReading: latestReading
             )
-            app.logger.info("🚚 \(logID) Sent stale update push to \(pushToken.rawValue.prefix(8))...")
+            app.logger.info("🚚 \(logID) Sent stale update push to \(tokenPrefix)...")
+            app.axiom?.emit("push_sent", attributes: [
+                "user": logID,
+                "environment": environment.rawValue,
+                "token_prefix": tokenPrefix,
+                "kind": "stale",
+            ])
         } catch {
-            app.logger.error("\(logID) Error sending stale update to \(pushToken.rawValue.prefix(8))...: \(error)")
+            app.logger.error("\(logID) Error sending stale update to \(tokenPrefix)...: \(error)")
+            let apnsReason = (error as? APNSCore.APNSError)?.reason?.reason
+            app.axiom?.emit("push_failed", attributes: [
+                "user": logID,
+                "environment": environment.rawValue,
+                "token_prefix": tokenPrefix,
+                "kind": "stale",
+                "error_type": apnsReason != nil ? "apns" : "other",
+                "apns_reason": apnsReason ?? "",
+                "error": String(describing: type(of: error)),
+            ])
         }
     }
 
