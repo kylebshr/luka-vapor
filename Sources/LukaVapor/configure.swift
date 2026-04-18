@@ -11,6 +11,14 @@ public func configure(_ app: Application) async throws {
     // Block bot/scanner traffic probing for PHP vulnerabilities
     app.middleware.use(BotBlockerMiddleware())
 
+    // Axiom observability (no-op if AXIOM_TOKEN / AXIOM_DATASET unset)
+    app.axiom = AxiomClient(client: app.client, logger: app.logger)
+    if app.axiom == nil {
+        app.logger.info("Axiom not configured (set AXIOM_TOKEN and AXIOM_DATASET to enable)")
+    } else {
+        app.logger.info("Axiom observability enabled")
+    }
+
     // Configure Redis (use REDIS_URL env var on Fly, localhost for local dev)
     let redisURL = Environment.get("REDIS_URL") ?? "redis://localhost:6379"
     app.redis.configuration = try RedisConfiguration(url: redisURL)
