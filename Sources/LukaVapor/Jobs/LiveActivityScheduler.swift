@@ -158,6 +158,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         let maxDuration = session.tokens.map(\.duration).max() ?? 3600
 
+        // Send stale updates before fetching so they go out even if the Dexcom call fails.
+        await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
+
         do {
             app.logger.info("🔄 \(session.logID) Checking for new readings")
             let readings = try await client.getGlucoseReadings(
@@ -166,7 +169,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             guard let latestReading = readings.last else {
                 app.logger.warning("🛑 \(session.logID) No readings available")
-                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
                 let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
                 await reschedule(
                     app: app,
@@ -184,8 +186,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             // Check if we have a new reading
             if let lastDate = session.lastReadingDate, latestReading.date <= lastDate {
                 let timeSinceLastReading = now.timeIntervalSince(lastDate)
-
-                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
 
                 if timeSinceLastReading >= Self.readingInterval {
                     // Reading is overdue - poll with backoff
