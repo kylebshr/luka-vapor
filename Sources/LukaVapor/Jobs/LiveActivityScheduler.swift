@@ -232,8 +232,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             await endAllTokens(app: app, session: session, reason: .dexcomError)
         } catch let error as DexcomDecodingError {
             await handleDecodingError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
+            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
         } catch {
             await handleGenericError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
+            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
         }
     }
 
