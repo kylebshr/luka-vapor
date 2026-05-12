@@ -86,6 +86,13 @@ func routes(_ app: Application) throws {
             _ = try await req.redis.hset("data", to: jsonStr, in: dataKey).get()
 
             req.logger.info("🆕 \(body.logID) Added token to existing session (\(session.tokens.count) tokens)")
+            app.axiom?.emit("session_started", attributes: [
+                "user": body.logID,
+                "environment": body.environment.rawValue,
+                "token_prefix": String(body.pushToken.rawValue.prefix(8)),
+                "kind": "token_added",
+                "token_count": String(session.tokens.count),
+            ])
         } else {
             // Create new session
             let session = LiveActivityPollSession(
@@ -113,6 +120,13 @@ func routes(_ app: Application) throws {
             ).get()
 
             req.logger.info("🆕 \(body.logID) Started new Live Activity session")
+            app.axiom?.emit("session_started", attributes: [
+                "user": body.logID,
+                "environment": body.environment.rawValue,
+                "token_prefix": String(body.pushToken.rawValue.prefix(8)),
+                "kind": "new",
+                "token_count": "1",
+            ])
         }
 
         return .ok
