@@ -34,8 +34,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
-    static let decodingErrorRetryLimit = 5
-    static let genericErrorRetryLimit = 3
+    static let decodingErrorRetryLimit = 10
+    static let genericErrorRetryLimit = 6
 
     func run(context: QueueContext) async throws {
         let app = context.application
@@ -166,6 +166,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             guard let latestReading = readings.last else {
                 app.logger.warning("🛑 \(session.logID) No readings available")
+                app.axiom?.emit("poll_empty", attributes: [
+                    "user": session.logID,
+                    "retry_count": String(session.retryCount),
+                    "minutes_since_last_reading": session.lastReadingDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "unknown",
+                ])
                 await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
                 let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
                 await reschedule(
@@ -229,11 +234,33 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         } catch let error as DexcomClientError {
             app.logger.error("\(session.logID) Ending all tokens due to DexcomClientError: \(error)")
+            app.axiom?.emit("poll_error", attributes: [
+                "user": session.logID,
+                "error_type": "client",
+                "error": String(describing: error),
+                "retry_count": String(session.retryCount),
+                "will_end": "true",
+            ])
             await endAllTokens(app: app, session: session, reason: .dexcomError)
         } catch let error as DexcomDecodingError {
+            app.axiom?.emit("poll_error", attributes: [
+                "user": session.logID,
+                "error_type": "decoding",
+                "status_code": error.statusCode?.description ?? "unknown",
+                "error": error.errorDescription,
+                "retry_count": String(session.retryCount),
+                "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit) ? "true" : "false",
+            ])
             await handleDecodingError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
             await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
         } catch {
+            app.axiom?.emit("poll_error", attributes: [
+                "user": session.logID,
+                "error_type": "generic",
+                "error": String(describing: error),
+                "retry_count": String(session.retryCount),
+                "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount >= Self.genericErrorRetryLimit) ? "true" : "false",
+            ])
             await handleGenericError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
             await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
         }
@@ -399,6 +426,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             app.logger.info("😴 \(session.logID) Scheduled for \(scheduledTime) (in \(formattedDelay))")
         } catch {
             app.logger.error("Failed to reschedule \(session.logID): \(error)")
+            app.axiom?.emit("reschedule_failed", attributes: [
+                "user": session.logID,
+                "error": String(describing: error),
+                "retry_count": String(session.retryCount),
+            ])
         }
     }
 
