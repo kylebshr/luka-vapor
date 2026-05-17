@@ -19,16 +19,6 @@ func routes(_ app: Application) throws {
 
         var session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
-        // Send end event to the token being removed
-        let environment = session.tokens.first { $0.pushToken == body.pushToken }?.environment ?? .production
-        await LiveActivityScheduler.sendEndEvent(app: app, pushToken: body.pushToken, environment: environment)
-        app.axiom?.emit("push_ended", attributes: [
-            "user": session.logID,
-            "environment": environment.rawValue,
-            "token_prefix": String(body.pushToken.rawValue.prefix(8)),
-            "reason": "user_requested",
-        ])
-
         // Remove the matching token
         session.tokens.removeAll { $0.pushToken == body.pushToken }
 
