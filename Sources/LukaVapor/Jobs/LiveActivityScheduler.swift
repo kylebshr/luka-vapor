@@ -313,7 +313,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             await endAllTokens(app: app, session: session, reason: .tooManyRetries)
         } else {
             let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
-            let delay = error.statusCode == 429 ? 60 + jitter() : session.pollInterval
+            let delay: TimeInterval = if error.statusCode == 429 {
+                Self.rateLimitBackoff(retryCount: session.retryCount)
+            } else {
+                session.pollInterval
+            }
 
             session.retryCount += 1
 
@@ -361,6 +365,17 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func jitter() -> TimeInterval {
         TimeInterval.random(in: -10...10)
+    }
+
+    /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account
+    /// and the window often outlasts a 60s wait, so escalate aggressively.
+    /// 120s → 240s → 480s → 600s (capped), with ±30s jitter.
+    static func rateLimitBackoff(retryCount: Int) -> TimeInterval {
+        let base: TimeInterval = 120
+        let max: TimeInterval = 600
+        let scaled = base * pow(2, Double(Swift.min(retryCount, 4)))
+        let capped = Swift.min(scaled, max)
+        return capped + TimeInterval.random(in: -30...30)
     }
 
     // MARK: - Scheduling
