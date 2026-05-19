@@ -31,6 +31,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let minInterval: TimeInterval = 4
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
+    static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
@@ -268,7 +269,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     // MARK: - Stale Updates
 
-    /// Sends stale milestone updates (at 5 and 10 minutes) when no new reading is available.
+    /// Sends stale milestone updates (at 5, 10, and 15 minutes) when no new reading is available.
     private func sendStaleUpdatesIfNeeded(app: Application, session: inout LiveActivityPollSession, now: Date) async {
         guard let lastReadingDate = session.lastReadingDate, let lastReading = session.lastReading else { return }
 
@@ -276,12 +277,20 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         guard timeSinceLastReading >= Self.readingInterval else { return }
 
         let staleMinutes = Int(timeSinceLastReading / 60)
-        let milestone: Int? = staleMinutes >= 10 ? 10 : (staleMinutes >= 5 ? 5 : nil)
+        let milestone: (minutes: Int, level: LiveActivityState.StaleLevel)? = if staleMinutes >= 15 {
+            (15, .offline)
+        } else if staleMinutes >= 10 {
+            (10, .stale)
+        } else if staleMinutes >= 5 {
+            (5, .warning)
+        } else {
+            nil
+        }
 
-        guard let milestone, session.lastStaleUpdateMinutes != milestone else { return }
+        guard let milestone, session.lastStaleUpdateMinutes != milestone.minutes else { return }
 
-        app.logger.info("📡 \(session.logID) Sending stale update at \(milestone) minutes")
-        session.lastStaleUpdateMinutes = milestone
+        app.logger.info("📡 \(session.logID) Sending stale update at \(milestone.minutes) minutes")
+        session.lastStaleUpdateMinutes = milestone.minutes
 
         let readings = session.readings ?? [lastReading]
         for token in session.tokens {
@@ -291,6 +300,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 environment: token.environment,
                 readings: readings,
                 latestReading: lastReading,
+                staleLevel: milestone.level,
                 logID: session.logID
             )
         }
@@ -363,10 +373,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         }
     }
 
-    private func jitter() -> TimeInterval {
-        TimeInterval.random(in: -10...10)
-    }
-
     /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account
     /// and the window often outlasts a 60s wait, so escalate aggressively.
     /// 120s → 240s → 480s → 600s (capped), with ±30s jitter.
@@ -422,7 +428,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         session.sessionID = sessionCapture.sessionID ?? session.sessionID
         if resetRetries {
             session.retryCount = 0
-            session.lastStaleUpdateMinutes = nil
         }
 
         let nextTimestamp = Date().addingTimeInterval(delay).timeIntervalSince1970
@@ -551,6 +556,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             return
         }
 
+        // A fresh reading landed — clear the stale-milestone dedup so the next
+        // run of staleness (if it happens) starts from the 5m milestone again.
+        session.lastStaleUpdateMinutes = nil
+
         // Schedule next poll
         await scheduleForNextReading(
             app: app,
@@ -569,6 +578,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         environment: PushEnvironment,
         readings: [GlucoseReading],
         latestReading: GlucoseReading,
+        staleLevel: LiveActivityState.StaleLevel? = nil,
         alert: APNSAlertNotificationContent? = nil
     ) async throws {
         let apnsClient = switch environment {
@@ -578,10 +588,15 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         let state = LiveActivityState(
             c: latestReading,
-            h: readings.map { .init(t: $0.date, v: Int16($0.value)) }
+            h: readings.map { .init(t: $0.date, v: Int16($0.value)) },
+            se: nil,
+            s: staleLevel
         )
 
-        let staleDate = Int(Date.now.addingTimeInterval(60 * 10).timeIntervalSince1970)
+        // staleDate = the absolute "offline-at" instant for this reading. If no further
+        // push arrives, the OS marks the activity stale at the same 15m mark our
+        // backend-driven offline level would.
+        let staleDate = Int(latestReading.date.addingTimeInterval(Self.offlineInterval).timeIntervalSince1970)
         try await apnsClient.sendLiveActivityNotification(
             .init(
                 expiration: .timeIntervalSince1970InSeconds(staleDate),
@@ -605,6 +620,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         environment: PushEnvironment,
         readings: [GlucoseReading],
         latestReading: GlucoseReading,
+        staleLevel: LiveActivityState.StaleLevel,
         logID: String
     ) async {
         let tokenPrefix = String(pushToken.rawValue.prefix(8))
@@ -614,7 +630,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 pushToken: pushToken,
                 environment: environment,
                 readings: readings,
-                latestReading: latestReading
+                latestReading: latestReading,
+                staleLevel: staleLevel
             )
             app.logger.info("🚚 \(logID) Sent stale update push to \(tokenPrefix)...")
             app.axiom?.emit("push_sent", attributes: [
