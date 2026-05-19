@@ -16,10 +16,19 @@ struct LiveActivityState: Codable, Hashable {
         var v: Int16
     }
 
+    enum StaleLevel: Int, Codable, Hashable {
+        case fresh = 0
+        case warning = 1
+        case stale = 2
+        case offline = 3
+    }
+
     /// current
     var c: GlucoseReading?
     /// history
     var h: [Reading]
     /// sessionExpired
-    var se: Bool?
+    var se: Bool? = nil
+    /// staleLevel
+    var s: StaleLevel? = nil
 }
