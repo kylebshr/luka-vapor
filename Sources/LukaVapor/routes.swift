@@ -1,9 +1,44 @@
 import Vapor
 import Redis
+import Dexcom
 
 func routes(_ app: Application) throws {
     app.get { req async in
         "Download Luka on the App Store."
+    }
+
+    app.get("glucose-readings") { req async throws -> Response in
+        guard let auth = req.headers.basicAuthorization else {
+            throw Abort(.unauthorized)
+        }
+
+        let dataKey = LiveActivityPollKeys.dataKey(for: auth.username)
+        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
+              let session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)),
+              session.password == auth.password,
+              let cached = session.readings, !cached.isEmpty
+        else {
+            throw Abort(.notFound)
+        }
+
+        let minutes = (try? req.query.get(Int.self, at: "minutes")) ?? 1440
+        let maxCount = (try? req.query.get(Int.self, at: "maxCount")) ?? 288
+        let cutoff = Date.now.addingTimeInterval(-TimeInterval(minutes) * 60)
+
+        let filtered = cached
+            .filter { $0.date >= cutoff }
+            .sorted { $0.date < $1.date }
+            .suffix(maxCount)
+
+        req.logger.info("📤 \(session.logID) Served \(filtered.count) cached readings")
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let body = try encoder.encode(Array(filtered))
+
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+        return Response(status: .ok, headers: headers, body: .init(data: body))
     }
 
     app.post("end-live-activity") { req async throws -> HTTPStatus in

@@ -157,12 +157,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         )
         await client.setDelegate(sessionCapture)
 
-        let maxDuration = session.tokens.map(\.duration).max() ?? 3600
-
         do {
             app.logger.info("🔄 \(session.logID) Checking for new readings")
             let readings = try await client.getGlucoseReadings(
-                duration: .init(value: maxDuration, unit: .seconds)
+                duration: .init(value: 24, unit: .hours)
             ).sorted { $0.date < $1.date }
 
             guard let latestReading = readings.last else {
@@ -294,11 +292,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         let readings = session.readings ?? [lastReading]
         for token in session.tokens {
+            let tokenReadings = trim(readings: readings, toDuration: token.duration, now: now)
             await sendStaleUpdate(
                 app: app,
                 pushToken: token.pushToken,
                 environment: token.environment,
-                readings: readings,
+                readings: tokenReadings,
                 latestReading: lastReading,
                 staleLevel: milestone.level,
                 logID: session.logID
@@ -371,6 +370,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 resetRetries: false
             )
         }
+    }
+
+    /// Trim a readings array to the window a given token cares about, so APNS
+    /// payloads don't balloon now that we cache 24h on the server.
+    private func trim(readings: [GlucoseReading], toDuration duration: TimeInterval, now: Date) -> [GlucoseReading] {
+        let cutoff = now.addingTimeInterval(-duration)
+        return readings.filter { $0.date >= cutoff }
     }
 
     /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account
@@ -496,12 +502,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         for token in session.tokens {
             let alertContent = alert(for: latestReading, lastReading: session.lastReading, preferences: token.preferences)
             let tokenPrefix = String(token.pushToken.rawValue.prefix(8))
+            let tokenReadings = trim(readings: readings, toDuration: token.duration, now: now)
             do {
                 try await sendActivityPush(
                     app: app,
                     pushToken: token.pushToken,
                     environment: token.environment,
-                    readings: readings,
+                    readings: tokenReadings,
                     latestReading: latestReading,
                     alert: alertContent
                 )
