@@ -610,7 +610,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             s: staleLevel,
             sd: sessionStartDate,
             td: tokenStartDate,
-            tc: tokenCount
+            tc: tokenCount,
+            pd: Date.now
         )
 
         // staleDate = the absolute "offline-at" instant for this reading. If no further

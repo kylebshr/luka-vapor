@@ -37,4 +37,6 @@ struct LiveActivityState: Codable, Hashable {
     var td: Date? = nil
     /// tokenCount — number of tokens currently receiving pushes for this session
     var tc: Int? = nil
+    /// pushDate — when this push was sent
+    var pd: Date? = nil
 }
