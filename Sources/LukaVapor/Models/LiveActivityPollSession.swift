@@ -21,6 +21,9 @@ struct LiveActivityPollSession: Codable, Sendable {
 
     var tokens: [LiveActivityTokenEntry]
 
+    // Optional for backwards compatibility with sessions already in Redis.
+    var sessionStartDate: Date?
+
     // Shared polling state
     var lastReadingDate: Date?
     var lastReading: GlucoseReading?

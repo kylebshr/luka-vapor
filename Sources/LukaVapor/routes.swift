@@ -127,6 +127,7 @@ func routes(_ app: Application) throws {
                 sessionID: body.sessionID,
                 accountLocation: body.accountLocation,
                 tokens: [tokenEntry],
+                sessionStartDate: Date.now,
                 pollInterval: LiveActivityScheduler.minInterval,
                 retryCount: 0
             )

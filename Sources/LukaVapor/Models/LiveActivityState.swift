@@ -31,4 +31,10 @@ struct LiveActivityState: Codable, Hashable {
     var se: Bool? = nil
     /// staleLevel
     var s: StaleLevel? = nil
+    /// sessionStartDate — when the live activity session first started
+    var sd: Date? = nil
+    /// tokenStartDate — when this push token was added to the session
+    var td: Date? = nil
+    /// tokenCount — number of tokens currently receiving pushes for this session
+    var tc: Int? = nil
 }
