@@ -300,6 +300,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 environment: token.environment,
                 readings: tokenReadings,
                 latestReading: lastReading,
+                sessionStartDate: session.sessionStartDate,
+                tokenStartDate: token.startDate,
+                tokenCount: session.tokens.count,
                 staleLevel: milestone.level,
                 logID: session.logID
             )
@@ -511,6 +514,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     environment: token.environment,
                     readings: tokenReadings,
                     latestReading: latestReading,
+                    sessionStartDate: session.sessionStartDate,
+                    tokenStartDate: token.startDate,
+                    tokenCount: session.tokens.count,
                     alert: alertContent
                 )
                 app.logger.info("🚚 \(session.logID) Sent push to \(tokenPrefix)...")
@@ -586,6 +592,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         environment: PushEnvironment,
         readings: [GlucoseReading],
         latestReading: GlucoseReading,
+        sessionStartDate: Date?,
+        tokenStartDate: Date,
+        tokenCount: Int,
         staleLevel: LiveActivityState.StaleLevel? = nil,
         alert: APNSAlertNotificationContent? = nil
     ) async throws {
@@ -598,7 +607,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             c: latestReading,
             h: readings.map { .init(t: $0.date, v: Int16($0.value)) },
             se: nil,
-            s: staleLevel
+            s: staleLevel,
+            sd: sessionStartDate,
+            td: tokenStartDate,
+            tc: tokenCount,
+            pd: Date.now
         )
 
         // staleDate = the absolute "offline-at" instant for this reading. If no further
@@ -632,6 +645,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         environment: PushEnvironment,
         readings: [GlucoseReading],
         latestReading: GlucoseReading,
+        sessionStartDate: Date?,
+        tokenStartDate: Date,
+        tokenCount: Int,
         staleLevel: LiveActivityState.StaleLevel,
         logID: String
     ) async {
@@ -643,6 +659,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 environment: environment,
                 readings: readings,
                 latestReading: latestReading,
+                sessionStartDate: sessionStartDate,
+                tokenStartDate: tokenStartDate,
+                tokenCount: tokenCount,
                 staleLevel: staleLevel
             )
             app.logger.info("🚚 \(logID) Sent stale update push to \(tokenPrefix)...")
