@@ -33,7 +33,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
-    static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
+    static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
