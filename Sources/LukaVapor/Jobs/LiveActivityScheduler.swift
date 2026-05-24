@@ -32,6 +32,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
+    static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
@@ -602,8 +603,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         // staleDate = the absolute "offline-at" instant for this reading. If no further
         // push arrives, the OS marks the activity stale at the same 15m mark our
-        // backend-driven offline level would.
-        let staleDate = Int(latestReading.date.addingTimeInterval(Self.offlineInterval).timeIntervalSince1970)
+        // backend-driven offline level would. Floor it to a small buffer in the future so
+        // a delayed reading (or a stale-milestone push at 10/15m) never sends a staleDate
+        // in the past — which would also cause APNS to drop the push via expiration.
+        let computedStaleDate = latestReading.date.addingTimeInterval(Self.offlineInterval)
+        let minStaleDate = Date().addingTimeInterval(Self.minStaleDateBuffer)
+        let staleDate = Int(max(computedStaleDate, minStaleDate).timeIntervalSince1970)
         try await apnsClient.sendLiveActivityNotification(
             .init(
                 expiration: .timeIntervalSince1970InSeconds(staleDate),
