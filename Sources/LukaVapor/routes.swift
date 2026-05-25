@@ -101,12 +101,15 @@ func routes(_ app: Application) throws {
 
         let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
 
+        let clientBuild = req.headers.first(name: "X-Luka-Build").flatMap(Int.init)
+
         let tokenEntry = LiveActivityTokenEntry(
             pushToken: body.pushToken,
             environment: body.environment,
             preferences: body.preferences,
             startDate: Date.now,
-            duration: body.duration
+            duration: body.duration,
+            clientBuild: clientBuild
         )
 
         // Try to load an existing session for this username

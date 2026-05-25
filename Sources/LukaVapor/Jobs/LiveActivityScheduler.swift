@@ -33,7 +33,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
-    static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
+    // Tokens from clients on builds > unlimitedBuildThreshold get no expiry; older builds cap at maximumDuration.
+    static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
+    static let unlimitedBuildThreshold = 297
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
@@ -112,9 +114,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            // 1. Per-token expiry: remove tokens past maximumDuration, send end to each
+            // 1. Per-token expiry: remove tokens past maximumDuration, send end to each.
+            // Tokens from clients on builds > unlimitedBuildThreshold are exempt and never expire here.
             var expiredTokens: [LiveActivityTokenEntry] = []
             session.tokens.removeAll { token in
+                if let build = token.clientBuild, build > Self.unlimitedBuildThreshold {
+                    return false
+                }
                 if now.timeIntervalSince(token.startDate) >= Self.maximumDuration {
                     expiredTokens.append(token)
                     return true
