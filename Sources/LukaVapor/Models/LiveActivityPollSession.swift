@@ -9,6 +9,8 @@ struct LiveActivityTokenEntry: Codable, Sendable {
     let preferences: LiveActivityPreferences?
     let startDate: Date
     let duration: TimeInterval
+    // Optional — older entries in Redis (and clients that don't send X-Luka-Build) won't have it.
+    let clientBuild: Int?
 }
 
 /// One per username — holds shared Dexcom polling state and all device tokens.

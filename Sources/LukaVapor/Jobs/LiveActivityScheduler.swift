@@ -28,12 +28,14 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
     static let appBundleID = "com.kylebashour.Glimpse"
-    static let minInterval: TimeInterval = 4
+    static let minInterval: TimeInterval = 10
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
-    static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
+    // Tokens from clients on builds > unlimitedBuildThreshold get no expiry; older builds cap at maximumDuration.
+    static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
+    static let unlimitedBuildThreshold = 297
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
@@ -112,9 +114,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            // 1. Per-token expiry: remove tokens past maximumDuration, send end to each
+            // 1. Per-token expiry: remove tokens past maximumDuration, send end to each.
+            // Tokens from clients on builds > unlimitedBuildThreshold are exempt and never expire here.
             var expiredTokens: [LiveActivityTokenEntry] = []
             session.tokens.removeAll { token in
+                if let build = token.clientBuild, build > Self.unlimitedBuildThreshold {
+                    return false
+                }
                 if now.timeIntervalSince(token.startDate) >= Self.maximumDuration {
                     expiredTokens.append(token)
                     return true
@@ -421,7 +427,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     ) async {
         let timeSinceReading = now.timeIntervalSince(readingDate)
         let timeUntilNextReading = Self.readingInterval - timeSinceReading
-        let delay = timeUntilNextReading + 10 // give 10s to try to ensure reading is ready
+        let delay = timeUntilNextReading + 20 // give 20s to try to ensure reading is ready (covers typical Share API propagation)
         await reschedule(
             app: app,
             session: &session,
