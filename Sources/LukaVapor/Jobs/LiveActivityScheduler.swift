@@ -28,7 +28,7 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
     static let appBundleID = "com.kylebashour.Glimpse"
-    static let minInterval: TimeInterval = 4
+    static let minInterval: TimeInterval = 10
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
@@ -427,7 +427,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     ) async {
         let timeSinceReading = now.timeIntervalSince(readingDate)
         let timeUntilNextReading = Self.readingInterval - timeSinceReading
-        let delay = timeUntilNextReading + 10 // give 10s to try to ensure reading is ready
+        let delay = timeUntilNextReading + 20 // give 20s to try to ensure reading is ready (covers typical Share API propagation)
         await reschedule(
             app: app,
             session: &session,
