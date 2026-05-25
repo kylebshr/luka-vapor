@@ -39,4 +39,6 @@ struct LiveActivityState: Codable, Hashable {
     var tc: Int? = nil
     /// pushDate — when this push was sent
     var pd: Date? = nil
+    /// reason — short human-readable reason for non-reading pushes (e.g. "No new readings", "Rate limited")
+    var r: String? = nil
 }
