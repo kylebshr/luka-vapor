@@ -11,3 +11,11 @@ struct EndLiveActivityRequest: Codable {
     var pushToken: LiveActivityPushToken
     var username: String
 }
+
+struct EndLiveActivitiesRequest: Codable {
+    var username: String
+}
+
+extension EndLiveActivitiesRequest {
+    var logID: String { username.redactedEmailLogID }
+}

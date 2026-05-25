@@ -75,6 +75,27 @@ func routes(_ app: Application) throws {
         return .ok
     }
 
+    app.post("end-live-activities") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(EndLiveActivitiesRequest.self)
+
+        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
+
+        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get() else {
+            req.logger.warning("⏹️  No session found for \(body.logID)")
+            return .ok
+        }
+
+        let session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
+        let tokenCount = session.tokens.count
+
+        _ = try await req.redis.zrem(body.username, from: LiveActivityPollKeys.scheduleKey).get()
+        _ = try await req.redis.delete(dataKey).get()
+
+        req.logger.info("⏹️  \(session.logID) Ended all sessions (\(tokenCount) tokens removed)")
+
+        return .ok
+    }
+
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
