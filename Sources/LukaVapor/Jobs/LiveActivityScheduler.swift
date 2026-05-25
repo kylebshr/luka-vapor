@@ -124,7 +124,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             for token in expiredTokens {
                 app.logger.info("🕟 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... reached max duration")
-                await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+                await Self.sendEndEvent(
+                    app: app,
+                    pushToken: token.pushToken,
+                    environment: token.environment,
+                    sessionStartDate: session.sessionStartDate,
+                    tokenStartDate: token.startDate,
+                    tokenCount: session.tokens.count
+                )
                 app.axiom?.emit("push_ended", attributes: [
                     "user": session.logID,
                     "environment": token.environment.rawValue,
@@ -171,7 +178,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     "retry_count": String(session.retryCount),
                     "minutes_since_last_reading": session.lastReadingDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "unknown",
                 ])
-                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
+                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
                 let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
                 await reschedule(
                     app: app,
@@ -190,7 +197,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             if let lastDate = session.lastReadingDate, latestReading.date <= lastDate {
                 let timeSinceLastReading = now.timeIntervalSince(lastDate)
 
-                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
+                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
 
                 if timeSinceLastReading >= Self.readingInterval {
                     // Reading is overdue - poll with backoff
@@ -252,7 +259,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit) ? "true" : "false",
             ])
             await handleDecodingError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
-            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
+            let staleReason = error.statusCode == 429 ? "Rate limited" : "Dexcom error"
+            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: staleReason)
         } catch {
             app.axiom?.emit("poll_error", attributes: [
                 "user": session.logID,
@@ -262,14 +270,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount >= Self.genericErrorRetryLimit) ? "true" : "false",
             ])
             await handleGenericError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
-            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now)
+            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "Polling error")
         }
     }
 
     // MARK: - Stale Updates
 
     /// Sends stale milestone updates (at 5, 10, and 15 minutes) when no new reading is available.
-    private func sendStaleUpdatesIfNeeded(app: Application, session: inout LiveActivityPollSession, now: Date) async {
+    private func sendStaleUpdatesIfNeeded(
+        app: Application,
+        session: inout LiveActivityPollSession,
+        now: Date,
+        reason: String?
+    ) async {
         guard let lastReadingDate = session.lastReadingDate, let lastReading = session.lastReading else { return }
 
         let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
@@ -304,6 +317,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 tokenStartDate: token.startDate,
                 tokenCount: session.tokens.count,
                 staleLevel: milestone.level,
+                reason: reason,
                 logID: session.logID
             )
         }
@@ -476,7 +490,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// Ends all tokens in a session and cleans up.
     private func endAllTokens(app: Application, session: LiveActivityPollSession, reason: EndReason) async {
         for token in session.tokens {
-            await Self.sendEndEvent(app: app, pushToken: token.pushToken, environment: token.environment)
+            await Self.sendEndEvent(
+                app: app,
+                pushToken: token.pushToken,
+                environment: token.environment,
+                sessionStartDate: session.sessionStartDate,
+                tokenStartDate: token.startDate,
+                tokenCount: session.tokens.count
+            )
             app.axiom?.emit("push_ended", attributes: [
                 "user": session.logID,
                 "environment": token.environment.rawValue,
@@ -596,6 +617,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         tokenStartDate: Date,
         tokenCount: Int,
         staleLevel: LiveActivityState.StaleLevel? = nil,
+        reason: String? = nil,
         alert: APNSAlertNotificationContent? = nil
     ) async throws {
         let apnsClient = switch environment {
@@ -611,7 +633,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             sd: sessionStartDate,
             td: tokenStartDate,
             tc: tokenCount,
-            pd: Date.now
+            pd: Date.now,
+            r: reason
         )
 
         // staleDate = the absolute "offline-at" instant for this reading. If no further
@@ -649,6 +672,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         tokenStartDate: Date,
         tokenCount: Int,
         staleLevel: LiveActivityState.StaleLevel,
+        reason: String?,
         logID: String
     ) async {
         let tokenPrefix = String(pushToken.rawValue.prefix(8))
@@ -662,7 +686,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 sessionStartDate: sessionStartDate,
                 tokenStartDate: tokenStartDate,
                 tokenCount: tokenCount,
-                staleLevel: staleLevel
+                staleLevel: staleLevel,
+                reason: reason
             )
             app.logger.info("🚚 \(logID) Sent stale update push to \(tokenPrefix)...")
             app.axiom?.emit("push_sent", attributes: [
@@ -686,18 +711,35 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         }
     }
 
-    static func sendEndEvent(app: Application, pushToken: LiveActivityPushToken, environment: PushEnvironment) async {
+    static func sendEndEvent(
+        app: Application,
+        pushToken: LiveActivityPushToken,
+        environment: PushEnvironment,
+        sessionStartDate: Date? = nil,
+        tokenStartDate: Date? = nil,
+        tokenCount: Int? = nil
+    ) async {
         let apnsClient = switch environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
         }
+
+        let state = LiveActivityState(
+            c: nil,
+            h: [],
+            se: true,
+            sd: sessionStartDate,
+            td: tokenStartDate,
+            tc: tokenCount,
+            pd: Date.now
+        )
 
         _ = try? await apnsClient.sendLiveActivityNotification(
             .init(
                 expiration: .none,
                 priority: .immediately,
                 appID: appBundleID,
-                contentState: LiveActivityState(c: nil, h: [], se: true),
+                contentState: state,
                 event: .end,
                 timestamp: Int(Date.now.timeIntervalSince1970),
                 dismissalDate: .none,
