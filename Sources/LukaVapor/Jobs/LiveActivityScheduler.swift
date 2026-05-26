@@ -33,9 +33,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
-    // Tokens from clients on builds > unlimitedBuildThreshold get no expiry; older builds cap at maximumDuration.
-    static let maximumDuration: TimeInterval = 60 * 60 * 4 // 4h
-    static let unlimitedBuildThreshold = 297
+    // Tokens from clients on builds > extendedDurationBuild get an extended expiry; older builds cap at legacyMaximumDuration.
+    static let legacyMaximumDuration: TimeInterval = 60 * 60 * 4 // 4h
+    static let extendedMaximumDuration: TimeInterval = 60 * 60 * 7.5 // 7.5h
+    static let extendedDurationBuild = 300
     static let backoff: TimeInterval = 1.8
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
@@ -114,14 +115,17 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            // 1. Per-token expiry: remove tokens past maximumDuration, send end to each.
-            // Tokens from clients on builds > unlimitedBuildThreshold are exempt and never expire here.
+            // 1. Per-token expiry: remove tokens past their max duration, send end to each.
+            // Newer builds (> extendedDurationBuild) cap at extendedMaximumDuration; older builds cap at legacyMaximumDuration.
             var expiredTokens: [LiveActivityTokenEntry] = []
             session.tokens.removeAll { token in
-                if let build = token.clientBuild, build > Self.unlimitedBuildThreshold {
-                    return false
+                let duration = if let build = token.clientBuild, build > Self.extendedDurationBuild {
+                    Self.extendedMaximumDuration
+                } else {
+                    Self.legacyMaximumDuration
                 }
-                if now.timeIntervalSince(token.startDate) >= Self.maximumDuration {
+
+                if now.timeIntervalSince(token.startDate) >= duration {
                     expiredTokens.append(token)
                     return true
                 }
