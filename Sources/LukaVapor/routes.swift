@@ -116,9 +116,16 @@ func routes(_ app: Application) throws {
         if let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
            var session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)) {
 
-            // Replace existing token entry or append new one
+            // Replace existing token entry (preserving original startDate) or append new one
             if let index = session.tokens.firstIndex(where: { $0.pushToken == body.pushToken }) {
-                session.tokens[index] = tokenEntry
+                session.tokens[index] = LiveActivityTokenEntry(
+                    pushToken: body.pushToken,
+                    environment: body.environment,
+                    preferences: body.preferences,
+                    startDate: session.tokens[index].startDate,
+                    duration: body.duration,
+                    clientBuild: clientBuild
+                )
             } else {
                 session.tokens.append(tokenEntry)
             }
