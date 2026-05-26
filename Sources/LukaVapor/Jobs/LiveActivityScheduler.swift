@@ -761,7 +761,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         lastReading: GlucoseReading?,
         preferences: LiveActivityPreferences?
     ) -> APNSAlertNotificationContent? {
-        guard let lastReading, let preferences else {
+        guard let lastReading, let preferences, preferences.alertsEnabled ?? true else {
             return nil
         }
 
