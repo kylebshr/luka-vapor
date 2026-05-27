@@ -28,7 +28,7 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
     static let appBundleID = "com.kylebashour.Glimpse"
-    static let minInterval: TimeInterval = 10
+    static let minInterval: TimeInterval = 30
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
@@ -37,7 +37,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let legacyMaximumDuration: TimeInterval = 60 * 60 * 4 // 4h
     static let extendedMaximumDuration: TimeInterval = 60 * 60 * 7.5 // 7.5h
     static let extendedDurationBuild = 300
-    static let backoff: TimeInterval = 1.8
+    static let backoff: TimeInterval = 2.0
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
     static let genericErrorRetryLimit = 6
