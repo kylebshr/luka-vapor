@@ -64,4 +64,23 @@ enum LiveActivityPollKeys {
     static func dataKey(for username: String) -> RedisKey {
         RedisKey("live-activities:poll:\(username)")
     }
+
+    /// Atomically removes the schedule entry and the data hash for a username.
+    /// A two-call zrem+del leaves a window where a concurrent `start-live-activity`
+    /// can read the still-existing data, then write it back after the delete fires —
+    /// leaving an orphan data hash with no schedule entry that the scheduler never polls.
+    static func removeSession(_ username: String, on client: any RedisClient) async throws {
+        let script = """
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        redis.call('DEL', KEYS[2])
+        return 1
+        """
+        _ = try await client.send(command: "EVAL", with: [
+            RESPValue(bulk: script),
+            RESPValue(bulk: "2"),
+            RESPValue(bulk: scheduleKey.rawValue),
+            RESPValue(bulk: dataKey(for: username).rawValue),
+            RESPValue(bulk: username),
+        ]).get()
+    }
 }
