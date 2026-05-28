@@ -263,6 +263,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "user": session.logID,
                 "error_type": "decoding",
                 "status_code": error.statusCode?.description ?? "unknown",
+                // Which Dexcom endpoint returned the error. Distinguishes a readings-endpoint
+                // rate limit from the auth/login endpoints, which tells us whether the client's
+                // re-auth-on-error path is amplifying 429s. Values: ReadPublisherLatestGlucoseValues
+                // (readings), AuthenticatePublisherAccount (auth), LoginPublisherAccountById (login).
+                "endpoint": error.url?.lastPathComponent ?? "unknown",
                 "error": error.errorDescription,
                 "retry_count": String(session.retryCount),
                 "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit) ? "true" : "false",
