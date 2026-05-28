@@ -59,8 +59,7 @@ func routes(_ app: Application) throws {
 
         if session.tokens.isEmpty {
             // No tokens left — clean up entirely
-            _ = try await req.redis.zrem(body.username, from: LiveActivityPollKeys.scheduleKey).get()
-            _ = try await req.redis.delete(dataKey).get()
+            try await LiveActivityPollKeys.removeSession(body.username, on: req.redis)
             req.logger.info("⏹️  \(session.logID) Ended last token, removed session")
         } else {
             // Save updated session
@@ -88,8 +87,7 @@ func routes(_ app: Application) throws {
         let session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
         let tokenCount = session.tokens.count
 
-        _ = try await req.redis.zrem(body.username, from: LiveActivityPollKeys.scheduleKey).get()
-        _ = try await req.redis.delete(dataKey).get()
+        try await LiveActivityPollKeys.removeSession(body.username, on: req.redis)
 
         req.logger.info("⏹️  \(session.logID) Ended all sessions (\(tokenCount) tokens removed)")
 
@@ -140,6 +138,16 @@ func routes(_ app: Application) throws {
                 throw Abort(.internalServerError, reason: "Failed to encode session data")
             }
             _ = try await req.redis.hset("data", to: jsonStr, in: dataKey).get()
+
+            // Ensure a schedule entry exists. If a prior race or partial failure left this
+            // session orphaned (data hash present, no schedule entry), the scheduler never
+            // polls it and the activity gets stuck — NX heals it without disturbing an
+            // already-scheduled score.
+            _ = try await req.redis.zadd(
+                (element: body.username, score: Date.now.timeIntervalSince1970),
+                to: LiveActivityPollKeys.scheduleKey,
+                inserting: .onlyNewElements
+            ).get()
 
             req.logger.info("🆕 \(body.logID) Added token to existing session (\(session.tokens.count) tokens)")
             app.axiom?.emit("session_started", attributes: [

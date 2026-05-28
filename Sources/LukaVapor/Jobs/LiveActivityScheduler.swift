@@ -101,8 +101,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     }
 
     private func removeSession(app: Application, username: String) async {
-        _ = try? await app.redis.zrem(username, from: LiveActivityPollKeys.scheduleKey).get()
-        _ = try? await app.redis.delete(LiveActivityPollKeys.dataKey(for: username)).get()
+        try? await LiveActivityPollKeys.removeSession(username, on: app.redis)
     }
 
     // MARK: - Session Processing
