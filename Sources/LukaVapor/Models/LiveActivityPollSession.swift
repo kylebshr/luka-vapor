@@ -76,11 +76,11 @@ enum LiveActivityPollKeys {
         return 1
         """
         _ = try await client.send(command: "EVAL", with: [
-            RESPValue(bulk: script),
-            RESPValue(bulk: "2"),
-            RESPValue(bulk: scheduleKey.rawValue),
-            RESPValue(bulk: dataKey(for: username).rawValue),
-            RESPValue(bulk: username),
+            RESPValue(from: script),
+            RESPValue(from: "2"),
+            RESPValue(from: scheduleKey.rawValue),
+            RESPValue(from: dataKey(for: username).rawValue),
+            RESPValue(from: username),
         ]).get()
     }
 }
