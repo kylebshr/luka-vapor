@@ -33,6 +33,11 @@ struct LiveActivityPollSession: Codable, Sendable {
     var pollInterval: TimeInterval
     var retryCount: Int
     var lastStaleUpdateMinutes: Int?
+
+    // Set when a rate limit (HTTP 429) is hit. Acts as a minimum poll spacing while
+    // easing back into normal polling, decaying toward minInterval on each healthy
+    // poll. Optional for backwards compatibility with sessions already in Redis.
+    var recoveryInterval: TimeInterval?
 }
 
 extension LiveActivityPollSession {

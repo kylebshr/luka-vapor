@@ -41,6 +41,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
     static let genericErrorRetryLimit = 6
+    // After a rate limit (429), poll no more often than this at first, then ease back
+    // toward minInterval (recoveryInterval shrinks to recoveryDecay of itself on each
+    // healthy poll) rather than immediately resuming the aggressive overdue cadence.
+    static let recoveryStartInterval: TimeInterval = 300 // 5 min
+    static let recoveryDecay: Double = 0.6
 
     func run(context: QueueContext) async throws {
         let app = context.application
@@ -188,14 +193,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     "minutes_since_last_reading": session.lastReadingDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "unknown",
                 ])
                 await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
-                let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
+                let nextPollInterval = min(session.pollInterval * Self.backoff, Self.pollCap(for: session))
                 await reschedule(
                     app: app,
                     session: &session,
                     pollInterval: nextPollInterval,
                     lastReading: session.lastReading,
                     readings: session.readings,
-                    delay: session.pollInterval,
+                    delay: max(session.pollInterval, Self.pollFloor(for: session)),
                     sessionCapture: sessionCapture,
                     resetRetries: true
                 )
@@ -209,15 +214,15 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
 
                 if timeSinceLastReading >= Self.readingInterval {
-                    // Reading is overdue - poll with backoff
-                    let nextPollInterval = min(session.pollInterval * Self.backoff, Self.maxInterval)
+                    // Reading is overdue - poll with backoff (kept gentle while recovering from a rate limit)
+                    let nextPollInterval = min(session.pollInterval * Self.backoff, Self.pollCap(for: session))
                     await reschedule(
                         app: app,
                         session: &session,
                         pollInterval: nextPollInterval,
                         lastReading: session.lastReading,
                         readings: session.readings,
-                        delay: session.pollInterval,
+                        delay: max(session.pollInterval, Self.pollFloor(for: session)),
                         sessionCapture: sessionCapture,
                         resetRetries: false
                     )
@@ -360,6 +365,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 session.pollInterval
             }
 
+            if error.statusCode == 429 {
+                // Once the rate limit clears, ease back into polling instead of resuming the
+                // aggressive overdue cadence, which tends to immediately re-trigger the 429.
+                session.recoveryInterval = Self.recoveryStartInterval
+            }
+
             session.retryCount += 1
 
             await reschedule(
@@ -411,15 +422,35 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return readings.filter { $0.date >= cutoff }
     }
 
-    /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account
-    /// and the window often outlasts a 60s wait, so escalate aggressively.
-    /// 120s → 240s → 480s → 600s (capped), with ±30s jitter.
+    /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account and the
+    /// window often outlasts a short wait, so start high and escalate aggressively.
+    /// 240s → 480s → 900s (capped), with ±60s jitter to de-sync sessions limited together.
     static func rateLimitBackoff(retryCount: Int) -> TimeInterval {
-        let base: TimeInterval = 120
-        let max: TimeInterval = 600
-        let scaled = base * pow(2, Double(Swift.min(retryCount, 4)))
+        let base: TimeInterval = 240
+        let max: TimeInterval = 900
+        let scaled = base * pow(2, Double(Swift.min(retryCount, 3)))
         let capped = Swift.min(scaled, max)
-        return capped + TimeInterval.random(in: -30...30)
+        return capped + TimeInterval.random(in: -60...60)
+    }
+
+    /// Eases the post-rate-limit recovery floor back toward normal polling. Returns the
+    /// next floor, or nil once it has shrunk back to (at or below) minInterval.
+    static func decayedRecovery(_ current: TimeInterval?) -> TimeInterval? {
+        guard let current else { return nil }
+        let next = current * recoveryDecay
+        return next > minInterval ? next : nil
+    }
+
+    /// Minimum spacing between polls, raised to the recovery floor while easing back
+    /// from a rate limit so we don't immediately resume the aggressive overdue cadence.
+    private static func pollFloor(for session: LiveActivityPollSession) -> TimeInterval {
+        Swift.max(minInterval, session.recoveryInterval ?? 0)
+    }
+
+    /// Upper bound on the backed-off poll interval, raised to the recovery floor so the
+    /// overdue backoff can settle above the normal maxInterval while recovering.
+    private static func pollCap(for session: LiveActivityPollSession) -> TimeInterval {
+        Swift.max(maxInterval, session.recoveryInterval ?? 0)
     }
 
     // MARK: - Scheduling
@@ -439,7 +470,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         await reschedule(
             app: app,
             session: &session,
-            pollInterval: Self.minInterval,
+            pollInterval: Self.pollFloor(for: session),
             lastReading: reading,
             readings: readings,
             delay: delay,
@@ -466,6 +497,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         session.sessionID = sessionCapture.sessionID ?? session.sessionID
         if resetRetries {
             session.retryCount = 0
+            // A healthy (non-error) poll — relax the post-rate-limit recovery floor a step.
+            session.recoveryInterval = Self.decayedRecovery(session.recoveryInterval)
         }
 
         let nextTimestamp = Date().addingTimeInterval(delay).timeIntervalSince1970
