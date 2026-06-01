@@ -35,7 +35,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     // Tokens from clients on builds > extendedDurationBuild get an extended expiry; older builds cap at legacyMaximumDuration.
     static let legacyMaximumDuration: TimeInterval = 60 * 60 * 4 // 4h
-    static let extendedMaximumDuration: TimeInterval = 60 * 60 * 7.5 // 7.5h
+    static let extendedMaximumDuration: TimeInterval = 60 * 60 * 7 // 7h
     static let extendedDurationBuild = 300
     static let backoff: TimeInterval = 2.0
     static let errorBackoff: TimeInterval = 3
