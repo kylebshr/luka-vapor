@@ -63,11 +63,7 @@ func routes(_ app: Application) throws {
             req.logger.info("⏹️  \(session.logID) Ended last token, removed session")
         } else {
             // Save updated session
-            let jsonData = try JSONEncoder().encode(session)
-            guard let updatedJSON = String(data: jsonData, encoding: .utf8) else {
-                throw Abort(.internalServerError, reason: "Failed to encode session data")
-            }
-            _ = try await req.redis.hset("data", to: updatedJSON, in: dataKey).get()
+            try await LiveActivityPollKeys.saveSession(session, on: req.redis)
             req.logger.info("⏹️  \(session.logID) Removed token, \(session.tokens.count) remaining")
         }
 
@@ -126,11 +122,7 @@ func routes(_ app: Application) throws {
             session.accountID = body.accountID ?? session.accountID
             session.sessionID = body.sessionID ?? session.sessionID
 
-            let jsonData = try JSONEncoder().encode(session)
-            guard let jsonStr = String(data: jsonData, encoding: .utf8) else {
-                throw Abort(.internalServerError, reason: "Failed to encode session data")
-            }
-            _ = try await req.redis.hset("data", to: jsonStr, in: dataKey).get()
+            try await LiveActivityPollKeys.saveSession(session, on: req.redis)
 
             // Ensure a schedule entry exists. If a prior race or partial failure left this
             // session orphaned (data hash present, no schedule entry), the scheduler never
@@ -164,11 +156,7 @@ func routes(_ app: Application) throws {
                 retryCount: 0
             )
 
-            let jsonData = try JSONEncoder().encode(session)
-            guard let jsonStr = String(data: jsonData, encoding: .utf8) else {
-                throw Abort(.internalServerError, reason: "Failed to encode session data")
-            }
-            _ = try await req.redis.hset("data", to: jsonStr, in: dataKey).get()
+            try await LiveActivityPollKeys.saveSession(session, on: req.redis)
 
             // Add to schedule sorted set (immediate execution)
             let nowTimestamp = Date.now.timeIntervalSince1970
