@@ -62,12 +62,37 @@ extension String {
     }
 }
 
+struct SessionEncodingError: Error {}
+
 /// Redis key helpers for the new poll-session namespace.
 enum LiveActivityPollKeys {
     static let scheduleKey = RedisKey("live-activities:poll-schedule")
 
+    /// Backstop TTL for a session's data hash. A session can't legitimately live longer
+    /// than its tokens' max activity duration (currently 7h, ended by 7.5h), so 8h
+    /// comfortably exceeds any active session while ensuring a leaked/orphaned hash —
+    /// one the scheduler has stopped polling — self-expires instead of lingering forever
+    /// and inflating Redis usage. Refreshed on every save, so an actively-polled session
+    /// never expires out from under us.
+    static let dataTTLSeconds = 8 * 60 * 60
+
     static func dataKey(for username: String) -> RedisKey {
         RedisKey("live-activities:poll:\(username)")
+    }
+
+    /// Writes the session's data hash and (re)applies the backstop TTL. All writers go
+    /// through here so no path can create a hash without an expiry.
+    static func saveSession(_ session: LiveActivityPollSession, on client: any RedisClient) async throws {
+        let key = dataKey(for: session.username)
+        let jsonData = try JSONEncoder().encode(session)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw SessionEncodingError()
+        }
+        _ = try await client.hset("data", to: jsonString, in: key).get()
+        _ = try await client.send(command: "EXPIRE", with: [
+            RESPValue(from: key.rawValue),
+            RESPValue(from: String(dataTTLSeconds)),
+        ]).get()
     }
 
     /// Atomically removes the schedule entry and the data hash for a username.

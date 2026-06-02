@@ -88,21 +88,30 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return usernames
     }
 
-    private func loadSession(app: Application, username: String) async throws -> LiveActivityPollSession? {
+    /// The outcome of trying to load a session's data hash. We distinguish an undecodable
+    /// hash (deterministic poison — must be removed) from a transient Redis error (which
+    /// throws and must NOT trigger removal, or a blip would delete live sessions).
+    private enum LoadedSession {
+        case present(LiveActivityPollSession)
+        case missing
+        case undecodable
+    }
+
+    private func loadSession(app: Application, username: String) async throws -> LoadedSession {
         let key = LiveActivityPollKeys.dataKey(for: username)
         guard let jsonString = try await app.redis.hget("data", from: key, as: String.self).get() else {
-            return nil
+            return .missing
         }
-        return try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
+        do {
+            return .present(try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)))
+        } catch {
+            app.logger.warning("🧟 \(username.prefix(8))... session data failed to decode: \(error)")
+            return .undecodable
+        }
     }
 
     private func saveSession(app: Application, session: LiveActivityPollSession) async throws {
-        let key = LiveActivityPollKeys.dataKey(for: session.username)
-        let jsonData = try JSONEncoder().encode(session)
-        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-            throw Abort(.internalServerError, reason: "Failed to encode session data as JSON string")
-        }
-        _ = try await app.redis.hset("data", to: jsonString, in: key).get()
+        try await LiveActivityPollKeys.saveSession(session, on: app.redis)
     }
 
     private func removeSession(app: Application, username: String) async {
@@ -113,8 +122,25 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     private func processSession(username: String, app: Application, now: Date) async {
         do {
-            guard var session = try await loadSession(app: app, username: username) else {
+            // Both a missing hash and an undecodable one are dead schedule entries: remove
+            // them so the every-second scheduler stops re-polling them forever (the cause of
+            // unbounded Redis growth decoupled from user count). A transient Redis error
+            // throws instead and is caught below WITHOUT removal, so a blip can't delete
+            // live sessions.
+            var session: LiveActivityPollSession
+            switch try await loadSession(app: app, username: username) {
+            case .present(let loaded):
+                session = loaded
+            case .missing:
                 app.logger.info("🗑️ Session \(username.prefix(8))... data not found, removing from schedule")
+                await removeSession(app: app, username: username)
+                return
+            case .undecodable:
+                app.logger.warning("🧟 Session \(username.prefix(8))... data undecodable, removing from schedule")
+                app.axiom?.emit("session_removed", attributes: [
+                    "user": username.redactedEmailLogID,
+                    "reason": "undecodable",
+                ])
                 await removeSession(app: app, username: username)
                 return
             }
