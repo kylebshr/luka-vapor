@@ -16,16 +16,30 @@ struct LukaVaporTests {
 
     @Test("Rate limit reschedules to the next reading, skipping the missed cycle")
     func rateLimitSkipsToNextReading() {
+        let floor = LiveActivityScheduler.rateLimitMinDelay
         let lastReading = Date()
+
         // Polled 20s after the expected reading (5m + 20s buffer) and got rate limited:
         // skip the missed reading and aim for the following one, ~5 min out.
-        let now = lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval + 20)
-        let delay = LiveActivityScheduler.delayUntilNextReading(after: lastReading, now: now)
-        #expect((280...320).contains(delay))
+        let overdueNow = lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval + 20)
+        let overdueDelay = LiveActivityScheduler.delayUntilNextReading(
+            after: lastReading, now: overdueNow, minimumDelay: floor
+        )
+        #expect((280...320).contains(overdueDelay))
 
-        // With no prior reading to anchor to, fall back to one reading interval.
-        let fallback = LiveActivityScheduler.delayUntilNextReading(after: nil, now: now)
-        #expect(fallback == LiveActivityScheduler.readingInterval + 20)
+        // Rate limited 40s *before* a reading is due: don't aim for that imminent reading
+        // (it'd just re-trigger the 429) — skip it and land on the following one, which is
+        // a full reading interval further out and comfortably past the 4-minute floor.
+        let beforeDueNow = lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval - 40)
+        let beforeDueDelay = LiveActivityScheduler.delayUntilNextReading(
+            after: lastReading, now: beforeDueNow, minimumDelay: floor
+        )
+        #expect(beforeDueDelay >= floor)
+        #expect((340...380).contains(beforeDueDelay)) // ~6 min: 40s to the skipped reading + 5m + buffer
+
+        // With no prior reading to anchor to, fall back to at least the floor.
+        let fallback = LiveActivityScheduler.delayUntilNextReading(after: nil, now: overdueNow, minimumDelay: floor)
+        #expect(fallback >= floor)
     }
 
     @Test("Recovery floor decays toward minInterval then clears")

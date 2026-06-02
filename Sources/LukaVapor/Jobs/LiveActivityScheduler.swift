@@ -48,6 +48,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // healthy poll) rather than immediately resuming the aggressive overdue cadence.
     static let recoveryStartInterval: TimeInterval = 300 // 5 min
     static let recoveryDecay: Double = 0.6
+    // On a 429, never reschedule sooner than this. A reading about to land would just get
+    // rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
+    static let rateLimitMinDelay: TimeInterval = 60 * 4 // 4 min
 
     func run(context: QueueContext) async throws {
         let app = context.application
@@ -362,10 +365,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         } else {
             let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
             let delay: TimeInterval = if error.statusCode == 429 {
-                // Skip the missed reading entirely and queue the next poll for when the
-                // next reading should arrive (~5 min out) rather than retrying within
-                // this cycle, which tends to immediately re-trigger the 429.
-                Self.delayUntilNextReading(after: session.lastReadingDate, now: Date())
+                // Queue the next poll for a reading boundary at least rateLimitMinDelay out,
+                // skipping any reading about to land — retrying right before it just
+                // re-triggers the 429.
+                Self.delayUntilNextReading(
+                    after: session.lastReadingDate,
+                    now: Date(),
+                    minimumDelay: Self.rateLimitMinDelay
+                )
             } else {
                 session.pollInterval
             }
@@ -427,19 +434,32 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return readings.filter { $0.date >= cutoff }
     }
 
-    /// Delay until the next expected reading, used to back off from an HTTP 429. Readings
-    /// arrive every `readingInterval`, and a rate limit window usually outlasts a short
-    /// wait — so rather than retrying within the current cycle (which just re-triggers the
-    /// 429), skip the missed reading entirely and aim for when the next one should land.
-    static func delayUntilNextReading(after lastReadingDate: Date?, now: Date) -> TimeInterval {
+    /// Delay until a reading boundary at least `minimumDelay` out, used to back off from an
+    /// HTTP 429. Readings arrive every `readingInterval`, and a rate limit window usually
+    /// outlasts a short wait — so rather than retrying within the current cycle (which just
+    /// re-triggers the 429), aim for the first reading boundary at least `minimumDelay` away.
+    /// Any reading about to land sooner than that is skipped, since polling right before it
+    /// while rate-limited would only re-trigger the limit.
+    static func delayUntilNextReading(
+        after lastReadingDate: Date?,
+        now: Date,
+        minimumDelay: TimeInterval = 0
+    ) -> TimeInterval {
         let buffer: TimeInterval = 20 // covers typical Share API propagation
         guard let lastReadingDate else {
-            return readingInterval + buffer
+            return Swift.max(readingInterval + buffer, minimumDelay)
         }
         let elapsed = now.timeIntervalSince(lastReadingDate)
         let cyclesElapsed = (elapsed / readingInterval).rounded(.down)
-        let nextReadingDate = lastReadingDate.addingTimeInterval((cyclesElapsed + 1) * readingInterval)
-        return Swift.max(nextReadingDate.timeIntervalSince(now), 0) + buffer
+        // Start at the first reading boundary still in the future, then keep skipping
+        // boundaries until the wait clears `minimumDelay`.
+        var nextReadingDate = lastReadingDate.addingTimeInterval((cyclesElapsed + 1) * readingInterval)
+        var delay = nextReadingDate.timeIntervalSince(now) + buffer
+        while delay < minimumDelay {
+            nextReadingDate.addTimeInterval(readingInterval)
+            delay = nextReadingDate.timeIntervalSince(now) + buffer
+        }
+        return delay
     }
 
     /// Eases the post-rate-limit recovery floor back toward normal polling. Returns the
