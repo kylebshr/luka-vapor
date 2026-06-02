@@ -28,7 +28,9 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
     static let appBundleID = "com.kylebashour.Glimpse"
-    static let minInterval: TimeInterval = 30
+    // Floor on poll spacing. When a reading is overdue/not yet ready we recheck no more
+    // often than this — a full minute rather than hammering every 30s.
+    static let minInterval: TimeInterval = 60
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
@@ -360,7 +362,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         } else {
             let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
             let delay: TimeInterval = if error.statusCode == 429 {
-                Self.rateLimitBackoff(retryCount: session.retryCount)
+                // Skip the missed reading entirely and queue the next poll for when the
+                // next reading should arrive (~5 min out) rather than retrying within
+                // this cycle, which tends to immediately re-trigger the 429.
+                Self.delayUntilNextReading(after: session.lastReadingDate, now: Date())
             } else {
                 session.pollInterval
             }
@@ -422,15 +427,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return readings.filter { $0.date >= cutoff }
     }
 
-    /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account and the
-    /// window often outlasts a short wait, so start high and escalate aggressively.
-    /// 240s → 480s → 900s (capped), with ±60s jitter to de-sync sessions limited together.
-    static func rateLimitBackoff(retryCount: Int) -> TimeInterval {
-        let base: TimeInterval = 240
-        let max: TimeInterval = 900
-        let scaled = base * pow(2, Double(Swift.min(retryCount, 3)))
-        let capped = Swift.min(scaled, max)
-        return capped + TimeInterval.random(in: -60...60)
+    /// Delay until the next expected reading, used to back off from an HTTP 429. Readings
+    /// arrive every `readingInterval`, and a rate limit window usually outlasts a short
+    /// wait — so rather than retrying within the current cycle (which just re-triggers the
+    /// 429), skip the missed reading entirely and aim for when the next one should land.
+    static func delayUntilNextReading(after lastReadingDate: Date?, now: Date) -> TimeInterval {
+        let buffer: TimeInterval = 20 // covers typical Share API propagation
+        guard let lastReadingDate else {
+            return readingInterval + buffer
+        }
+        let elapsed = now.timeIntervalSince(lastReadingDate)
+        let cyclesElapsed = (elapsed / readingInterval).rounded(.down)
+        let nextReadingDate = lastReadingDate.addingTimeInterval((cyclesElapsed + 1) * readingInterval)
+        return Swift.max(nextReadingDate.timeIntervalSince(now), 0) + buffer
     }
 
     /// Eases the post-rate-limit recovery floor back toward normal polling. Returns the
