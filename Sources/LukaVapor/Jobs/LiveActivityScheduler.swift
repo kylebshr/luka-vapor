@@ -28,7 +28,9 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
     static let appBundleID = "com.kylebashour.Glimpse"
-    static let minInterval: TimeInterval = 30
+    // Floor on poll spacing. When a reading is overdue/not yet ready we recheck no more
+    // often than this — a full minute rather than hammering every 30s.
+    static let minInterval: TimeInterval = 60
     static let maxInterval: TimeInterval = 60
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
@@ -46,6 +48,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // healthy poll) rather than immediately resuming the aggressive overdue cadence.
     static let recoveryStartInterval: TimeInterval = 300 // 5 min
     static let recoveryDecay: Double = 0.6
+    // On a 429, never reschedule sooner than this. A reading about to land would just get
+    // rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
+    static let rateLimitMinDelay: TimeInterval = 60 * 4 // 4 min
 
     func run(context: QueueContext) async throws {
         let app = context.application
@@ -386,7 +391,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         } else {
             let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
             let delay: TimeInterval = if error.statusCode == 429 {
-                Self.rateLimitBackoff(retryCount: session.retryCount)
+                // Queue the next poll for a reading boundary at least rateLimitMinDelay out,
+                // skipping any reading about to land — retrying right before it just
+                // re-triggers the 429.
+                Self.delayUntilNextReading(
+                    after: session.lastReadingDate,
+                    now: Date(),
+                    minimumDelay: Self.rateLimitMinDelay
+                )
             } else {
                 session.pollInterval
             }
@@ -448,15 +460,32 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return readings.filter { $0.date >= cutoff }
     }
 
-    /// Exponential backoff for HTTP 429 from Dexcom. Rate limits are per-account and the
-    /// window often outlasts a short wait, so start high and escalate aggressively.
-    /// 240s → 480s → 900s (capped), with ±60s jitter to de-sync sessions limited together.
-    static func rateLimitBackoff(retryCount: Int) -> TimeInterval {
-        let base: TimeInterval = 240
-        let max: TimeInterval = 900
-        let scaled = base * pow(2, Double(Swift.min(retryCount, 3)))
-        let capped = Swift.min(scaled, max)
-        return capped + TimeInterval.random(in: -60...60)
+    /// Delay until a reading boundary at least `minimumDelay` out, used to back off from an
+    /// HTTP 429. Readings arrive every `readingInterval`, and a rate limit window usually
+    /// outlasts a short wait — so rather than retrying within the current cycle (which just
+    /// re-triggers the 429), aim for the first reading boundary at least `minimumDelay` away.
+    /// Any reading about to land sooner than that is skipped, since polling right before it
+    /// while rate-limited would only re-trigger the limit.
+    static func delayUntilNextReading(
+        after lastReadingDate: Date?,
+        now: Date,
+        minimumDelay: TimeInterval = 0
+    ) -> TimeInterval {
+        let buffer: TimeInterval = 20 // covers typical Share API propagation
+        guard let lastReadingDate else {
+            return Swift.max(readingInterval + buffer, minimumDelay)
+        }
+        let elapsed = now.timeIntervalSince(lastReadingDate)
+        let cyclesElapsed = (elapsed / readingInterval).rounded(.down)
+        // Start at the first reading boundary still in the future, then keep skipping
+        // boundaries until the wait clears `minimumDelay`.
+        var nextReadingDate = lastReadingDate.addingTimeInterval((cyclesElapsed + 1) * readingInterval)
+        var delay = nextReadingDate.timeIntervalSince(now) + buffer
+        while delay < minimumDelay {
+            nextReadingDate.addTimeInterval(readingInterval)
+            delay = nextReadingDate.timeIntervalSince(now) + buffer
+        }
+        return delay
     }
 
     /// Eases the post-rate-limit recovery floor back toward normal polling. Returns the
