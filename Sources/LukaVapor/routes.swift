@@ -8,8 +8,12 @@ func routes(_ app: Application) throws {
     }
 
     app.get("glucose-readings") { req async throws -> Response in
+        // Return statuses directly rather than `throw Abort(...)`: clients poll this
+        // endpoint constantly and a missing/not-yet-populated session is a normal,
+        // expected outcome. Throwing routes the abort through ErrorMiddleware, which logs
+        // a WARNING per request — drowning the logs. Returning a Response skips that.
         guard let auth = req.headers.basicAuthorization else {
-            throw Abort(.unauthorized)
+            return Response(status: .unauthorized)
         }
 
         let dataKey = LiveActivityPollKeys.dataKey(for: auth.username)
@@ -18,7 +22,7 @@ func routes(_ app: Application) throws {
               session.password == auth.password,
               let cached = session.readings, !cached.isEmpty
         else {
-            throw Abort(.notFound)
+            return Response(status: .notFound)
         }
 
         let minutes = (try? req.query.get(Int.self, at: "minutes")) ?? 1440
