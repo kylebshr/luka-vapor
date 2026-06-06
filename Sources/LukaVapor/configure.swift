@@ -72,16 +72,26 @@ public func configure(_ app: Application) async throws {
     try routes(app)
 
     // One-time cleanup of legacy Live Activity keys left behind by the old `luka-vapor`
-    // (pre-poll-schedule) implementation. Idempotent and namespace-disjoint from the
-    // current poll-session keys, so it's safe to run on every boot. Remove once Redis is
-    // confirmed clean.
-    await removeLegacyLiveActivityKeys(app)
+    // (pre-poll-schedule) implementation. Runs as a post-boot lifecycle handler — Redis
+    // connection pools only exist after boot, so this must not run inline in configure().
+    // Idempotent and namespace-disjoint from the current poll-session keys, so it's safe to
+    // run on every boot. Remove once Redis is confirmed clean.
+    app.lifecycle.use(LegacyKeyCleanup())
 
     // Register scheduled job to run every second
     app.queues.schedule(LiveActivityScheduler()).everySecond()
 
     // Start scheduled jobs worker
     try app.queues.startScheduledJobs()
+}
+
+/// Runs the legacy-key cleanup after the app has booted, when Redis connection pools are
+/// available. Registered via `app.lifecycle.use` after Redis is configured, so its
+/// `didBootAsync` fires after RediStack's own boot lifecycle has set up the pools.
+struct LegacyKeyCleanup: LifecycleHandler {
+    func didBootAsync(_ application: Application) async throws {
+        await removeLegacyLiveActivityKeys(application)
+    }
 }
 
 /// Removes legacy Live Activity keys written by the old `luka-vapor` app, which predates
