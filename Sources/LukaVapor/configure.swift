@@ -71,9 +71,49 @@ public func configure(_ app: Application) async throws {
     // register routes
     try routes(app)
 
+    // One-time cleanup of legacy Live Activity keys left behind by the old `luka-vapor`
+    // (pre-poll-schedule) implementation. Idempotent and namespace-disjoint from the
+    // current poll-session keys, so it's safe to run on every boot. Remove once Redis is
+    // confirmed clean.
+    await removeLegacyLiveActivityKeys(app)
+
     // Register scheduled job to run every second
     app.queues.schedule(LiveActivityScheduler()).everySecond()
 
     // Start scheduled jobs worker
     try app.queues.startScheduledJobs()
+}
+
+/// Removes legacy Live Activity keys written by the old `luka-vapor` app, which predates
+/// the poll-schedule rewrite. The current namespace is `live-activities:poll-schedule` and
+/// `live-activities:poll:*`; the legacy scheme used `live-activities:schedule` (a sorted
+/// set) and `live-activity:data:*` (per-activity hashes). Those prefixes are disjoint from
+/// the current ones, so this only touches old data. Idempotent — deleting absent keys is a
+/// no-op — and best-effort: a failure logs but never blocks boot.
+private func removeLegacyLiveActivityKeys(_ app: Application) async {
+    do {
+        let deletedSchedule = try await app.redis.delete([RedisKey("live-activities:schedule")]).get()
+
+        var cursor = 0
+        var deletedData = 0
+        repeat {
+            let (next, keys) = try await app.redis.scan(
+                startingFrom: cursor,
+                matching: "live-activity:data:*",
+                count: 250
+            ).get()
+            cursor = next
+            if !keys.isEmpty {
+                deletedData += try await app.redis.delete(keys.map { RedisKey($0) }).get()
+            }
+        } while cursor != 0
+
+        if deletedSchedule > 0 || deletedData > 0 {
+            app.logger.info("🧹 Removed legacy Live Activity keys: schedule=\(deletedSchedule), data hashes=\(deletedData)")
+        } else {
+            app.logger.info("🧹 No legacy Live Activity keys found")
+        }
+    } catch {
+        app.logger.warning("Legacy Live Activity key cleanup failed: \(error)")
+    }
 }
