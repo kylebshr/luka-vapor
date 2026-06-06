@@ -160,7 +160,16 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     Self.legacyMaximumDuration
                 }
 
-                if now.timeIntervalSince(token.startDate) >= duration {
+                // Expire relative to when the activity actually started. Entries with a
+                // stable activityID preserve startDate across push-token rotations, so it
+                // reflects the true activity start. Legacy entries have no stable identity
+                // (a rotated token creates a fresh entry, resetting startDate), so fall
+                // back to the session start date to bound their lifetime.
+                let activityStart = token.activityID != nil
+                    ? token.startDate
+                    : (session.sessionStartDate ?? token.startDate)
+
+                if now.timeIntervalSince(activityStart) >= duration {
                     expiredTokens.append(token)
                     return true
                 }

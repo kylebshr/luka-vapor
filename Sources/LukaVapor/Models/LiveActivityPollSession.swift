@@ -2,15 +2,25 @@ import Foundation
 import Dexcom
 @preconcurrency import Redis
 
-/// One entry per device/push token in a poll session.
+/// One entry per Live Activity in a poll session.
 struct LiveActivityTokenEntry: Codable, Sendable {
+    // The current push token for this activity. Push tokens rotate over an activity's
+    // lifetime, so this is updated in place (keyed by `activityID`) rather than treated
+    // as the activity's identity.
     let pushToken: LiveActivityPushToken
     let environment: PushEnvironment
     let preferences: LiveActivityPreferences?
+    // When the activity started. Preserved across push-token rotations (matched by
+    // `activityID`) so the activity expires relative to its real start, not the last
+    // token refresh.
     let startDate: Date
     let duration: TimeInterval
     // Optional — older entries in Redis (and clients that don't send X-Luka-Build) won't have it.
     let clientBuild: Int?
+    // Stable per-activity identity (ActivityKit's `Activity.id`). Optional for backwards
+    // compatibility with entries already in Redis and older clients that don't send it;
+    // when absent, the entry falls back to push-token matching and session-based expiry.
+    let activityID: String?
 }
 
 /// One per username — holds shared Dexcom polling state and all device tokens.

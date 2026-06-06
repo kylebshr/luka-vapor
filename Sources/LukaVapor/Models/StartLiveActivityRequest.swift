@@ -31,6 +31,10 @@ struct StartLiveActivityRequest: Codable, Sendable {
     var accountLocation: AccountLocation
     var duration: TimeInterval
     var preferences: LiveActivityPreferences?
+    // Stable per-activity identity (ActivityKit's `Activity.id`). Sent on every call —
+    // initial start and subsequent push-token updates — so a rotated token maps back to
+    // the same activity. Optional for older clients that don't send it yet.
+    var activityID: String?
 }
 
 extension StartLiveActivityRequest {

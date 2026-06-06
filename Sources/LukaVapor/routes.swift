@@ -54,8 +54,14 @@ func routes(_ app: Application) throws {
 
         var session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
-        // Remove the matching token
-        session.tokens.removeAll { $0.pushToken == body.pushToken }
+        // Remove the matching entry. Prefer the stable activityID — the push token may
+        // have rotated since the client last saw it, so token-only matching can miss the
+        // entry. Fall back to push-token matching for legacy clients without an activityID.
+        if let activityID = body.activityID {
+            session.tokens.removeAll { $0.activityID == activityID }
+        } else {
+            session.tokens.removeAll { $0.pushToken == body.pushToken }
+        }
 
         if session.tokens.isEmpty {
             // No tokens left — clean up entirely
@@ -103,16 +109,41 @@ func routes(_ app: Application) throws {
             preferences: body.preferences,
             startDate: Date.now,
             duration: body.duration,
-            clientBuild: clientBuild
+            clientBuild: clientBuild,
+            activityID: body.activityID
         )
 
         // Try to load an existing session for this username
         if let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
            var session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)) {
 
-            // Replace existing token entry or append new one
-            if let index = session.tokens.firstIndex(where: { $0.pushToken == body.pushToken }) {
-                session.tokens[index] = tokenEntry
+            // Find the existing entry for this activity. Newer clients send a stable
+            // activityID that survives push-token rotation, so match on it: a rotated
+            // token updates the existing entry instead of creating a duplicate that resets
+            // the activity's lifetime. (If the client upgraded mid-activity, the stored
+            // entry may predate activityID — adopt it by its current push token.) Legacy
+            // clients with no activityID fall back to push-token matching.
+            let existingIndex: Int?
+            if let activityID = body.activityID {
+                existingIndex = session.tokens.firstIndex { $0.activityID == activityID }
+                    ?? session.tokens.firstIndex { $0.activityID == nil && $0.pushToken == body.pushToken }
+            } else {
+                existingIndex = session.tokens.firstIndex { $0.activityID == nil && $0.pushToken == body.pushToken }
+            }
+
+            // Replace the existing entry or append a new one. When replacing, preserve the
+            // original start date so the activity's lifetime isn't reset on every refresh —
+            // only the push token and other fields are updated.
+            if let index = existingIndex {
+                session.tokens[index] = LiveActivityTokenEntry(
+                    pushToken: tokenEntry.pushToken,
+                    environment: tokenEntry.environment,
+                    preferences: tokenEntry.preferences,
+                    startDate: session.tokens[index].startDate,
+                    duration: tokenEntry.duration,
+                    clientBuild: tokenEntry.clientBuild,
+                    activityID: tokenEntry.activityID ?? session.tokens[index].activityID
+                )
             } else {
                 session.tokens.append(tokenEntry)
             }
