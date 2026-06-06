@@ -2,7 +2,7 @@ import Vapor
 import APNS
 import APNSCore
 import VaporAPNS
-import Redis
+@preconcurrency import Redis
 import Queues
 import QueuesRedisDriver
 
@@ -90,25 +90,32 @@ public func configure(_ app: Application) async throws {
 /// `didBootAsync` fires after RediStack's own boot lifecycle has set up the pools.
 struct LegacyKeyCleanup: LifecycleHandler {
     func didBootAsync(_ application: Application) async throws {
-        await removeLegacyLiveActivityKeys(application)
+        await runStartupRedisCleanup(application)
     }
 }
 
-/// Removes legacy Live Activity keys written by the old `luka-vapor` app, which predates
-/// the poll-schedule rewrite. The current namespace is `live-activities:poll-schedule` and
-/// `live-activities:poll:*`; the legacy scheme used `live-activities:schedule` (a sorted
-/// set) and `live-activity:data:*` (per-activity hashes). Those prefixes are disjoint from
-/// the current ones, so this only touches old data. Idempotent — deleting absent keys is a
-/// no-op — and best-effort: a failure logs but never blocks boot.
+/// One-time Redis cleanup run after boot. Two concerns, both idempotent and best-effort:
+///
+/// 1. Legacy keys from the old `luka-vapor` app (pre-poll-schedule rewrite):
+///    `live-activities:schedule` (a sorted set) and `live-activity:data:*` (per-activity
+///    hashes). These prefixes are disjoint from the current `live-activities:poll*`
+///    namespace, so removing them only touches old data.
+///
+/// 2. Orphaned current-namespace data hashes that predate the TTL backstop (added in
+///    ba513d9): every live write now sets an 8h `EXPIRE`, so a `live-activities:poll:*`
+///    hash with no TTL is an orphan the scheduler isn't refreshing — a memory leak. We
+///    delete those. The persistent `live-activities:poll-schedule` set (no TTL by design)
+///    is never matched by the `poll:*` glob, so it's safe.
 ///
 /// Retries on failure: even at `didBoot` the connection pool may not be able to lease a
 /// connection yet (TLS handshake to the Redis host, pool warmup), so the first attempt(s)
 /// can fail with `timedOutWaitingForConnection`. We retry with a short delay until the pool
 /// is ready, then give up after `maxAttempts` rather than retrying forever.
-private func removeLegacyLiveActivityKeys(_ app: Application) async {
+private func runStartupRedisCleanup(_ app: Application) async {
     let maxAttempts = 6
     for attempt in 1...maxAttempts {
         do {
+            // 1. Legacy keys from the pre-poll-schedule implementation.
             let deletedSchedule = try await app.redis.delete([RedisKey("live-activities:schedule")]).get()
 
             var cursor = 0
@@ -125,17 +132,34 @@ private func removeLegacyLiveActivityKeys(_ app: Application) async {
                 }
             } while cursor != 0
 
-            if deletedSchedule > 0 || deletedData > 0 {
-                app.logger.info("🧹 Removed legacy Live Activity keys: schedule=\(deletedSchedule), data hashes=\(deletedData)")
+            // 2. Orphaned current-namespace hashes with no TTL (leaked before the backstop).
+            var orphanCursor = 0
+            var deletedOrphans = 0
+            repeat {
+                let (next, keys) = try await app.redis.scan(
+                    startingFrom: orphanCursor,
+                    matching: "live-activities:poll:*",
+                    count: 250
+                ).get()
+                orphanCursor = next
+                for key in keys {
+                    if case .unlimited = try await app.redis.ttl(RedisKey(key)).get() {
+                        deletedOrphans += try await app.redis.delete([RedisKey(key)]).get()
+                    }
+                }
+            } while orphanCursor != 0
+
+            if deletedSchedule > 0 || deletedData > 0 || deletedOrphans > 0 {
+                app.logger.info("🧹 Redis cleanup: legacy schedule=\(deletedSchedule), legacy data=\(deletedData), orphaned poll hashes (no TTL)=\(deletedOrphans)")
             } else {
-                app.logger.info("🧹 No legacy Live Activity keys found")
+                app.logger.info("🧹 Redis cleanup: nothing to remove")
             }
             return
         } catch {
             if attempt == maxAttempts {
-                app.logger.warning("Legacy Live Activity key cleanup failed after \(maxAttempts) attempts: \(error)")
+                app.logger.warning("Startup Redis cleanup failed after \(maxAttempts) attempts: \(error)")
             } else {
-                app.logger.info("Legacy Live Activity key cleanup attempt \(attempt) failed, retrying: \(error)")
+                app.logger.info("Startup Redis cleanup attempt \(attempt) failed, retrying: \(error)")
                 try? await Task.sleep(for: .seconds(2))
             }
         }
