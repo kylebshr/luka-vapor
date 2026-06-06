@@ -100,30 +100,44 @@ struct LegacyKeyCleanup: LifecycleHandler {
 /// set) and `live-activity:data:*` (per-activity hashes). Those prefixes are disjoint from
 /// the current ones, so this only touches old data. Idempotent — deleting absent keys is a
 /// no-op — and best-effort: a failure logs but never blocks boot.
+///
+/// Retries on failure: even at `didBoot` the connection pool may not be able to lease a
+/// connection yet (TLS handshake to the Redis host, pool warmup), so the first attempt(s)
+/// can fail with `timedOutWaitingForConnection`. We retry with a short delay until the pool
+/// is ready, then give up after `maxAttempts` rather than retrying forever.
 private func removeLegacyLiveActivityKeys(_ app: Application) async {
-    do {
-        let deletedSchedule = try await app.redis.delete([RedisKey("live-activities:schedule")]).get()
+    let maxAttempts = 6
+    for attempt in 1...maxAttempts {
+        do {
+            let deletedSchedule = try await app.redis.delete([RedisKey("live-activities:schedule")]).get()
 
-        var cursor = 0
-        var deletedData = 0
-        repeat {
-            let (next, keys) = try await app.redis.scan(
-                startingFrom: cursor,
-                matching: "live-activity:data:*",
-                count: 250
-            ).get()
-            cursor = next
-            if !keys.isEmpty {
-                deletedData += try await app.redis.delete(keys.map { RedisKey($0) }).get()
+            var cursor = 0
+            var deletedData = 0
+            repeat {
+                let (next, keys) = try await app.redis.scan(
+                    startingFrom: cursor,
+                    matching: "live-activity:data:*",
+                    count: 250
+                ).get()
+                cursor = next
+                if !keys.isEmpty {
+                    deletedData += try await app.redis.delete(keys.map { RedisKey($0) }).get()
+                }
+            } while cursor != 0
+
+            if deletedSchedule > 0 || deletedData > 0 {
+                app.logger.info("🧹 Removed legacy Live Activity keys: schedule=\(deletedSchedule), data hashes=\(deletedData)")
+            } else {
+                app.logger.info("🧹 No legacy Live Activity keys found")
             }
-        } while cursor != 0
-
-        if deletedSchedule > 0 || deletedData > 0 {
-            app.logger.info("🧹 Removed legacy Live Activity keys: schedule=\(deletedSchedule), data hashes=\(deletedData)")
-        } else {
-            app.logger.info("🧹 No legacy Live Activity keys found")
+            return
+        } catch {
+            if attempt == maxAttempts {
+                app.logger.warning("Legacy Live Activity key cleanup failed after \(maxAttempts) attempts: \(error)")
+            } else {
+                app.logger.info("Legacy Live Activity key cleanup attempt \(attempt) failed, retrying: \(error)")
+                try? await Task.sleep(for: .seconds(2))
+            }
         }
-    } catch {
-        app.logger.warning("Legacy Live Activity key cleanup failed: \(error)")
     }
 }
