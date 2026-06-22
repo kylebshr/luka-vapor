@@ -41,4 +41,7 @@ struct LiveActivityState: Codable, Hashable {
     var pd: Date? = nil
     /// reason — short human-readable reason for non-reading pushes (e.g. "No new readings", "Rate limited")
     var r: String? = nil
+    /// pushToStartAvailable — whether this token has a stored push-to-start token (i.e. is eligible
+    /// for auto-restart). Surfaced in the app's Live Activity debug info.
+    var ps: Bool? = nil
 }

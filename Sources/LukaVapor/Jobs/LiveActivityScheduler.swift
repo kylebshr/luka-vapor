@@ -401,6 +401,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 tokenCount: session.tokens.count,
                 staleLevel: milestone.level,
                 reason: reason,
+                pushToStartAvailable: token.pushToStartToken != nil,
                 logID: session.logID
             )
         }
@@ -673,6 +674,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     sessionStartDate: session.sessionStartDate,
                     tokenStartDate: token.startDate,
                     tokenCount: session.tokens.count,
+                    pushToStartAvailable: token.pushToStartToken != nil,
                     alert: alertContent
                 )
                 app.logger.info("🚚 \(session.logID) Sent push to \(tokenPrefix)...")
@@ -753,6 +755,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         tokenCount: Int,
         staleLevel: LiveActivityState.StaleLevel? = nil,
         reason: String? = nil,
+        pushToStartAvailable: Bool = false,
         alert: APNSAlertNotificationContent? = nil
     ) async throws {
         let apnsClient = switch environment {
@@ -769,7 +772,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             td: tokenStartDate,
             tc: tokenCount,
             pd: Date.now,
-            r: reason
+            r: reason,
+            ps: pushToStartAvailable
         )
 
         // staleDate = the absolute "offline-at" instant for this reading. If no further
@@ -808,6 +812,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         tokenCount: Int,
         staleLevel: LiveActivityState.StaleLevel,
         reason: String?,
+        pushToStartAvailable: Bool,
         logID: String
     ) async {
         let tokenPrefix = String(pushToken.rawValue.prefix(8))
@@ -822,7 +827,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 tokenStartDate: tokenStartDate,
                 tokenCount: tokenCount,
                 staleLevel: staleLevel,
-                reason: reason
+                reason: reason,
+                pushToStartAvailable: pushToStartAvailable
             )
             app.logger.info("🚚 \(logID) Sent stale update push to \(tokenPrefix)...")
             app.axiom?.emit("push_sent", attributes: [
