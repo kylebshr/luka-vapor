@@ -15,12 +15,10 @@ struct LiveActivityTokenEntry: Codable, Sendable {
     // token refresh.
     let startDate: Date
     let duration: TimeInterval
-    // Optional — older entries in Redis (and clients that don't send X-Luka-Build) won't have it.
-    let clientBuild: Int?
-    // Stable per-activity identity (ActivityKit's `Activity.id`). Optional for backwards
-    // compatibility with entries already in Redis and older clients that don't send it;
-    // when absent, the entry falls back to push-token matching and session-based expiry.
-    let activityID: String?
+    // Stable per-activity identity (ActivityKit's `Activity.id`). Used for matching across
+    // push-token rotations and for per-activity expiry. Always present: clients are
+    // force-updated to send it, and all pre-activityID entries have aged out of Redis.
+    let activityID: String
 
     // Push-to-start: when present, the activity is auto-restarted on this same device when
     // it reaches its max duration (dismiss old, start new). Stored alongside the push token

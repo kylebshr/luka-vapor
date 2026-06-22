@@ -8,12 +8,11 @@
 import Foundation
 
 struct EndLiveActivityRequest: Codable {
-    var pushToken: LiveActivityPushToken
     var username: String
-    // Stable per-activity identity (ActivityKit's `Activity.id`). Preferred for matching
-    // since the push token may have rotated since the client last saw it. Optional for
-    // older clients that only send the push token.
-    var activityID: String?
+    // Stable per-activity identity (ActivityKit's `Activity.id`). The sole matching key —
+    // the push token may have rotated since the client last saw it. Required: clients are
+    // force-updated to always send it. (Clients still send `pushToken`; it's ignored.)
+    var activityID: String
 }
 
 struct EndLiveActivitiesRequest: Codable {

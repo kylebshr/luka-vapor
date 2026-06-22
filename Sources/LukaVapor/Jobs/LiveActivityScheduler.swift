@@ -35,10 +35,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
-    // Tokens from clients on builds > extendedDurationBuild get an extended expiry; older builds cap at legacyMaximumDuration.
-    static let legacyMaximumDuration: TimeInterval = 60 * 60 * 4 // 4h
-    static let extendedMaximumDuration: TimeInterval = 60 * 60 * 7 // 7h
-    static let extendedDurationBuild = 300
+    // Max lifetime of a Live Activity before the server ends it. Supported by all builds.
+    static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
     static let backoff: TimeInterval = 2.0
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
@@ -151,25 +149,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             }
 
             // 1. Per-token expiry: remove tokens past their max duration, send end to each.
-            // Newer builds (> extendedDurationBuild) cap at extendedMaximumDuration; older builds cap at legacyMaximumDuration.
             var expiredTokens: [LiveActivityTokenEntry] = []
             session.tokens.removeAll { token in
-                let duration = if let build = token.clientBuild, build > Self.extendedDurationBuild {
-                    Self.extendedMaximumDuration
-                } else {
-                    Self.legacyMaximumDuration
-                }
+                let duration = Self.maximumDuration
 
-                // Expire relative to when the activity actually started. Entries with a
-                // stable activityID preserve startDate across push-token rotations, so it
-                // reflects the true activity start. Legacy entries have no stable identity
-                // (a rotated token creates a fresh entry, resetting startDate), so fall
-                // back to the session start date to bound their lifetime.
-                let activityStart = token.activityID != nil
-                    ? token.startDate
-                    : (session.sessionStartDate ?? token.startDate)
-
-                if now.timeIntervalSince(activityStart) >= duration {
+                // Expire relative to when the activity actually started. startDate is
+                // preserved across push-token rotations (matched by activityID), so it
+                // reflects the true activity start.
+                if now.timeIntervalSince(token.startDate) >= duration {
                     expiredTokens.append(token)
                     return true
                 }

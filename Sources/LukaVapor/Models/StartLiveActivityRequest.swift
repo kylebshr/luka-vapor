@@ -33,8 +33,8 @@ struct StartLiveActivityRequest: Codable, Sendable {
     var preferences: LiveActivityPreferences?
     // Stable per-activity identity (ActivityKit's `Activity.id`). Sent on every call —
     // initial start and subsequent push-token updates — so a rotated token maps back to
-    // the same activity. Optional for older clients that don't send it yet.
-    var activityID: String?
+    // the same activity. Required: clients are force-updated to always send it.
+    var activityID: String
 
     // Push-to-start support. When the client opts in (experimental toggle), it sends the
     // device's push-to-start token plus the attributes needed to start a fresh activity.
