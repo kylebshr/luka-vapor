@@ -58,14 +58,9 @@ func routes(_ app: Application) throws {
 
         var session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
-        // Remove the matching entry. Prefer the stable activityID — the push token may
-        // have rotated since the client last saw it, so token-only matching can miss the
-        // entry. Fall back to push-token matching for legacy clients without an activityID.
-        if let activityID = body.activityID {
-            session.tokens.removeAll { $0.activityID == activityID }
-        } else {
-            session.tokens.removeAll { $0.pushToken == body.pushToken }
-        }
+        // Remove the matching entry by its stable activityID — the push token may have
+        // rotated since the client last saw it, so it's not a reliable key.
+        session.tokens.removeAll { $0.activityID == body.activityID }
 
         if session.tokens.isEmpty {
             // No tokens left — clean up entirely
@@ -105,15 +100,12 @@ func routes(_ app: Application) throws {
 
         let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
 
-        let clientBuild = req.headers.first(name: "X-Luka-Build").flatMap(Int.init)
-
         let tokenEntry = LiveActivityTokenEntry(
             pushToken: body.pushToken,
             environment: body.environment,
             preferences: body.preferences,
             startDate: Date.now,
             duration: body.duration,
-            clientBuild: clientBuild,
             activityID: body.activityID,
             pushToStartToken: body.pushToStartToken,
             attributesType: body.attributesType,
@@ -124,19 +116,10 @@ func routes(_ app: Application) throws {
         if let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
            var session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)) {
 
-            // Find the existing entry for this activity. Newer clients send a stable
-            // activityID that survives push-token rotation, so match on it: a rotated
-            // token updates the existing entry instead of creating a duplicate that resets
-            // the activity's lifetime. (If the client upgraded mid-activity, the stored
-            // entry may predate activityID — adopt it by its current push token.) Legacy
-            // clients with no activityID fall back to push-token matching.
-            let existingIndex: Int?
-            if let activityID = body.activityID {
-                existingIndex = session.tokens.firstIndex { $0.activityID == activityID }
-                    ?? session.tokens.firstIndex { $0.activityID == nil && $0.pushToken == body.pushToken }
-            } else {
-                existingIndex = session.tokens.firstIndex { $0.activityID == nil && $0.pushToken == body.pushToken }
-            }
+            // Find the existing entry for this activity by its stable activityID, which
+            // survives push-token rotation: a rotated token updates the existing entry
+            // instead of creating a duplicate that resets the activity's lifetime.
+            let existingIndex = session.tokens.firstIndex { $0.activityID == body.activityID }
 
             // Replace the existing entry or append a new one. When replacing, preserve the
             // original start date so the activity's lifetime isn't reset on every refresh —
@@ -148,8 +131,7 @@ func routes(_ app: Application) throws {
                     preferences: tokenEntry.preferences,
                     startDate: session.tokens[index].startDate,
                     duration: tokenEntry.duration,
-                    clientBuild: tokenEntry.clientBuild,
-                    activityID: tokenEntry.activityID ?? session.tokens[index].activityID,
+                    activityID: tokenEntry.activityID,
                     // Take push-to-start info from the latest call verbatim (no fallback to the
                     // stored value): the client re-registers whenever its push-to-start token
                     // arrives or changes, so honoring exactly what it sends lets the user opt
@@ -239,16 +221,8 @@ func routes(_ app: Application) throws {
 
         let session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
-        // Match the token the same way end-live-activity does: prefer the stable activityID,
-        // fall back to the push token.
-        let token: LiveActivityTokenEntry?
-        if let activityID = body.activityID {
-            token = session.tokens.first { $0.activityID == activityID }
-        } else if let pushToken = body.pushToken {
-            token = session.tokens.first { $0.pushToken.rawValue == pushToken }
-        } else {
-            throw Abort(.badRequest, reason: "Must provide activityID or pushToken")
-        }
+        // Match the token by its stable activityID, the same way end-live-activity does.
+        let token = session.tokens.first { $0.activityID == body.activityID }
 
         guard let token else {
             req.logger.warning("🔁 \(session.logID) No matching token to restart")
