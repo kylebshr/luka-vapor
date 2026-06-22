@@ -35,6 +35,14 @@ struct StartLiveActivityRequest: Codable, Sendable {
     // initial start and subsequent push-token updates — so a rotated token maps back to
     // the same activity. Optional for older clients that don't send it yet.
     var activityID: String?
+
+    // Push-to-start support. When the client opts in (experimental toggle), it sends the
+    // device's push-to-start token plus the attributes needed to start a fresh activity.
+    // The server uses these to auto-restart the activity on the same device when it ends
+    // because the time limit was reached. All optional for backward compatibility.
+    var pushToStartToken: String?
+    var attributesType: String?      // e.g. "ReadingAttributes"
+    var attributes: JSONValue?       // opaque, app-encoded ActivityAttributes (e.g. {"range": ...})
 }
 
 extension StartLiveActivityRequest {

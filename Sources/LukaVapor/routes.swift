@@ -114,7 +114,10 @@ func routes(_ app: Application) throws {
             startDate: Date.now,
             duration: body.duration,
             clientBuild: clientBuild,
-            activityID: body.activityID
+            activityID: body.activityID,
+            pushToStartToken: body.pushToStartToken,
+            attributesType: body.attributesType,
+            attributes: body.attributes
         )
 
         // Try to load an existing session for this username
@@ -146,7 +149,14 @@ func routes(_ app: Application) throws {
                     startDate: session.tokens[index].startDate,
                     duration: tokenEntry.duration,
                     clientBuild: tokenEntry.clientBuild,
-                    activityID: tokenEntry.activityID ?? session.tokens[index].activityID
+                    activityID: tokenEntry.activityID ?? session.tokens[index].activityID,
+                    // Take push-to-start info from the latest call verbatim (no fallback to the
+                    // stored value): the client re-registers whenever its push-to-start token
+                    // arrives or changes, so honoring exactly what it sends lets the user opt
+                    // out — sending nil clears a previously stored token instead of pinning it.
+                    pushToStartToken: tokenEntry.pushToStartToken,
+                    attributesType: tokenEntry.attributesType,
+                    attributes: tokenEntry.attributes
                 )
             } else {
                 session.tokens.append(tokenEntry)

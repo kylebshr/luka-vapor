@@ -21,6 +21,15 @@ struct LiveActivityTokenEntry: Codable, Sendable {
     // compatibility with entries already in Redis and older clients that don't send it;
     // when absent, the entry falls back to push-token matching and session-based expiry.
     let activityID: String?
+
+    // Push-to-start: when present, the activity is auto-restarted on this same device when
+    // it reaches its max duration (dismiss old, start new). Stored alongside the push token
+    // because the scheduler only has the persisted session at expiry time — there is no
+    // request context then. Bounded by the session's backstop TTL like everything else.
+    // All optional: only set when the client opts into the experiment.
+    let pushToStartToken: String?
+    let attributesType: String?
+    let attributes: JSONValue?
 }
 
 /// One per username — holds shared Dexcom polling state and all device tokens.

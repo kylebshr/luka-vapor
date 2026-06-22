@@ -177,20 +177,44 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             }
 
             for token in expiredTokens {
-                app.logger.info("🕟 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... reached max duration")
+                // If the client opted into auto-restart and gave us a push-to-start token,
+                // dismiss the old activity and start a fresh one on the same device for
+                // continuous coverage past the time limit. The app observes the new activity,
+                // captures its update token, and re-registers — starting a new session.
+                // Require all three: a start push with a missing/empty attributes object would
+                // fail to decode on-device into the activity's ActivityAttributes.
+                let restartInfo: (token: String, type: String, attributes: JSONValue)? =
+                    if let pts = token.pushToStartToken, let type = token.attributesType, let attributes = token.attributes {
+                        (pts, type, attributes)
+                    } else {
+                        nil
+                    }
+                let willRestart = restartInfo != nil
+                app.logger.info("🕟 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... reached max duration\(willRestart ? ", restarting via push-to-start" : "")")
                 await Self.sendEndEvent(
                     app: app,
                     pushToken: token.pushToken,
                     environment: token.environment,
                     sessionStartDate: session.sessionStartDate,
                     tokenStartDate: token.startDate,
-                    tokenCount: session.tokens.count
+                    tokenCount: session.tokens.count,
+                    dismiss: willRestart
                 )
+                if let restartInfo {
+                    await Self.sendStartEvent(
+                        app: app,
+                        pushToStartToken: restartInfo.token,
+                        environment: token.environment,
+                        attributesType: restartInfo.type,
+                        attributes: restartInfo.attributes,
+                        logID: session.logID
+                    )
+                }
                 app.axiom?.emit("push_ended", attributes: [
                     "user": session.logID,
                     "environment": token.environment.rawValue,
                     "token_prefix": String(token.pushToken.rawValue.prefix(8)),
-                    "reason": "max_duration",
+                    "reason": willRestart ? "max_duration_restarted" : "max_duration",
                 ])
             }
 
@@ -664,7 +688,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 let apnsReason = error.reason?.reason ?? "unknown"
                 var willRemove = false
                 if let reason = error.reason,
-                   reason == .badDeviceToken || reason == .unregistered || reason.reason == "ExpiredToken" {
+                   reason == .badDeviceToken || reason == .unregistered || reason == .expiredToken {
                     app.logger.error("\(session.logID) Removing token \(tokenPrefix)... due to \(reason.reason)")
                     tokensToRemove.insert(token.pushToken)
                     willRemove = true
@@ -828,7 +852,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         environment: PushEnvironment,
         sessionStartDate: Date? = nil,
         tokenStartDate: Date? = nil,
-        tokenCount: Int? = nil
+        tokenCount: Int? = nil,
+        // Dismiss the activity immediately rather than letting it linger on the lock screen.
+        // Used when we're about to replace it with a push-to-start restart.
+        dismiss: Bool = false
     ) async {
         let apnsClient = switch environment {
         case .development: await app.apns.client(.development)
@@ -853,12 +880,86 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 contentState: state,
                 event: .end,
                 timestamp: Int(Date.now.timeIntervalSince1970),
-                dismissalDate: .none,
+                dismissalDate: dismiss ? .immediately : .none,
                 staleDate: nil,
                 apnsID: nil
             ),
             deviceToken: pushToken.rawValue
         )
+    }
+
+    /// Starts a fresh Live Activity on the same device via push-to-start. The app observes
+    /// `activityUpdates`, captures the new activity's update token, and re-registers with
+    /// the server — which creates a new session with a fresh time limit.
+    static func sendStartEvent(
+        app: Application,
+        pushToStartToken: String,
+        environment: PushEnvironment,
+        attributesType: String,
+        attributes: JSONValue?,
+        logID: String
+    ) async {
+        let apnsClient = switch environment {
+        case .development: await app.apns.client(.development)
+        case .production: await app.apns.client(.production)
+        }
+
+        // Minimal initial content; the new session pushes real readings within seconds.
+        let state = LiveActivityState(c: nil, h: [], se: false, pd: Date.now)
+        let staleDate = Int(Date.now.addingTimeInterval(offlineInterval).timeIntervalSince1970)
+
+        let notification = APNSStartLiveActivityNotification(
+            // Give APNs a real expiration (not .immediately) so it stores and retries the
+            // start push if the device is briefly unreachable — otherwise a single missed
+            // delivery means no restart at all, which is the common failure at hour 7.
+            expiration: .timeIntervalSince1970InSeconds(staleDate),
+            priority: .immediately,
+            appID: appBundleID,
+            contentState: state,
+            timestamp: Int(Date.now.timeIntervalSince1970),
+            staleDate: staleDate,
+            apnsID: nil,
+            attributes: attributes ?? .object([:]),
+            attributesType: attributesType,
+            alert: .init(
+                title: .raw("Luka"),
+                body: .raw("Glucose monitoring resumed")
+            )
+        )
+
+        do {
+            try await apnsClient.sendStartLiveActivityNotification(
+                notification,
+                pushToStartToken: pushToStartToken
+            )
+            app.logger.info("🔁 \(logID) Sent push-to-start to \(pushToStartToken.prefix(8))...")
+            app.axiom?.emit("push_started", attributes: [
+                "user": logID,
+                "environment": environment.rawValue,
+                "token_prefix": String(pushToStartToken.prefix(8)),
+                "kind": "push_to_start",
+            ])
+        } catch let error as APNSCore.APNSError {
+            app.logger.error("\(logID) push-to-start failed: \(error)")
+            app.axiom?.emit("push_failed", attributes: [
+                "user": logID,
+                "environment": environment.rawValue,
+                "token_prefix": String(pushToStartToken.prefix(8)),
+                "kind": "push_to_start",
+                "error_type": "apns",
+                "apns_reason": error.reason?.reason ?? "unknown",
+            ])
+        } catch {
+            app.logger.error("\(logID) Unexpected error sending push-to-start: \(error)")
+            app.axiom?.emit("push_failed", attributes: [
+                "user": logID,
+                "environment": environment.rawValue,
+                "token_prefix": String(pushToStartToken.prefix(8)),
+                "kind": "push_to_start",
+                "error_type": "other",
+                "error": String(describing: type(of: error)),
+            ])
+        }
     }
 
     private func alert(
