@@ -222,4 +222,65 @@ func routes(_ app: Application) throws {
 
         return .ok
     }
+
+    // Debug-only: manually trigger a push-to-start restart for one activity (dismiss old,
+    // start new) without waiting for the time limit. Returns 404 if no session/token is
+    // found, and 422 if the token has no push-to-start info stored (e.g. the client never
+    // opted in). The session is left untouched — the app's lifecycle observers re-register
+    // the new activity, just like the real max-duration restart.
+    app.post("restart-live-activity") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(DebugRestartLiveActivityRequest.self)
+
+        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
+        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get() else {
+            req.logger.warning("🔁 \(body.logID) No session found to restart")
+            throw Abort(.notFound, reason: "No session found")
+        }
+
+        let session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
+
+        // Match the token the same way end-live-activity does: prefer the stable activityID,
+        // fall back to the push token.
+        let token: LiveActivityTokenEntry?
+        if let activityID = body.activityID {
+            token = session.tokens.first { $0.activityID == activityID }
+        } else if let pushToken = body.pushToken {
+            token = session.tokens.first { $0.pushToken.rawValue == pushToken }
+        } else {
+            throw Abort(.badRequest, reason: "Must provide activityID or pushToken")
+        }
+
+        guard let token else {
+            req.logger.warning("🔁 \(session.logID) No matching token to restart")
+            throw Abort(.notFound, reason: "No matching token")
+        }
+
+        guard let pushToStartToken = token.pushToStartToken,
+              let attributesType = token.attributesType,
+              let attributes = token.attributes else {
+            req.logger.warning("🔁 \(session.logID) Token has no push-to-start info")
+            throw Abort(.unprocessableEntity, reason: "No push-to-start token for this activity")
+        }
+
+        req.logger.notice("🔁 \(session.logID) Debug restart via push-to-start")
+        await LiveActivityScheduler.sendEndEvent(
+            app: app,
+            pushToken: token.pushToken,
+            environment: token.environment,
+            sessionStartDate: session.sessionStartDate,
+            tokenStartDate: token.startDate,
+            tokenCount: session.tokens.count,
+            dismiss: true
+        )
+        await LiveActivityScheduler.sendStartEvent(
+            app: app,
+            pushToStartToken: pushToStartToken,
+            environment: token.environment,
+            attributesType: attributesType,
+            attributes: attributes,
+            logID: session.logID
+        )
+
+        return .ok
+    }
 }
