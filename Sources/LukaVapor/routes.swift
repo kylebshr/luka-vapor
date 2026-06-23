@@ -246,12 +246,20 @@ func routes(_ app: Application) throws {
             tokenCount: session.tokens.count,
             dismiss: true
         )
+        let now = Date()
+        let cachedReadings = session.readings ?? session.lastReading.map { [$0] } ?? []
+        let cutoff = now.addingTimeInterval(-token.duration)
         await LiveActivityScheduler.sendStartEvent(
             app: app,
             pushToStartToken: pushToStartToken,
             environment: token.environment,
             attributesType: attributesType,
             attributes: attributes,
+            latestReading: session.lastReading,
+            readings: cachedReadings.filter { $0.date >= cutoff },
+            sessionStartDate: session.sessionStartDate,
+            tokenCount: session.tokens.count,
+            now: now,
             logID: session.logID
         )
 
