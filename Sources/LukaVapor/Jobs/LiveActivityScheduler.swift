@@ -250,7 +250,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     "minutes_since_last_reading": session.lastReadingDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "unknown",
                 ])
                 await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
-                let nextPollInterval = min(session.pollInterval * Self.backoff, Self.pollCap(for: session))
+                let nextPollInterval = min(session.pollInterval * Self.backoff, Self.overduePollCap(for: session))
                 await reschedule(
                     app: app,
                     session: &session,
@@ -271,8 +271,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
 
                 if timeSinceLastReading >= Self.readingInterval {
-                    // Reading is overdue - poll with backoff (kept gentle while recovering from a rate limit)
-                    let nextPollInterval = min(session.pollInterval * Self.backoff, Self.pollCap(for: session))
+                    // Reading is overdue. Back off toward the reading cadence (~5 min) rather
+                    // than polling every 60s — a new value can't land sooner, so faster polls
+                    // only spend the account's Dexcom read budget and draw 429s. First recheck
+                    // stays quick (delay uses the current, smaller pollInterval) to catch a
+                    // slightly-late reading; sustained gaps settle at overduePollCap.
+                    let nextPollInterval = min(session.pollInterval * Self.backoff, Self.overduePollCap(for: session))
                     await reschedule(
                         app: app,
                         session: &session,
@@ -527,10 +531,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         Swift.max(minInterval, session.recoveryInterval ?? 0)
     }
 
-    /// Upper bound on the backed-off poll interval, raised to the recovery floor so the
-    /// overdue backoff can settle above the normal maxInterval while recovering.
-    private static func pollCap(for session: LiveActivityPollSession) -> TimeInterval {
-        Swift.max(maxInterval, session.recoveryInterval ?? 0)
+    /// Upper bound on poll spacing while waiting out a no-reading gap. A new value can't
+    /// arrive faster than the sensor's reading cadence, so once a reading is overdue we let
+    /// the backoff grow toward `readingInterval` (≈5 min) rather than pinning at `maxInterval`
+    /// (60s). Polling every 60s during a gap just burns the account's per-account Dexcom read
+    /// budget on requests that can't return anything new — the dominant source of 429s for
+    /// gap-heavy users. Still respects an active post-429 recovery floor.
+    private static func overduePollCap(for session: LiveActivityPollSession) -> TimeInterval {
+        Swift.max(readingInterval, session.recoveryInterval ?? 0)
     }
 
     // MARK: - Scheduling
