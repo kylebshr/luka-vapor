@@ -188,12 +188,18 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     dismiss: willRestart
                 )
                 if let restartInfo {
+                    let cachedReadings = session.readings ?? session.lastReading.map { [$0] } ?? []
                     await Self.sendStartEvent(
                         app: app,
                         pushToStartToken: restartInfo.token,
                         environment: token.environment,
                         attributesType: restartInfo.type,
                         attributes: restartInfo.attributes,
+                        latestReading: session.lastReading,
+                        readings: trim(readings: cachedReadings, toDuration: token.duration, now: now),
+                        sessionStartDate: session.sessionStartDate,
+                        tokenCount: session.tokens.count,
+                        now: now,
                         logID: session.logID
                     )
                 }
@@ -358,21 +364,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
         guard timeSinceLastReading >= Self.readingInterval else { return }
 
-        let staleMinutes = Int(timeSinceLastReading / 60)
-        let milestone: (minutes: Int, level: LiveActivityState.StaleLevel)? = if staleMinutes >= 15 {
-            (15, .offline)
-        } else if staleMinutes >= 10 {
-            (10, .stale)
-        } else if staleMinutes >= 5 {
-            (5, .warning)
-        } else {
-            nil
+        // Share the threshold ladder with the push-to-start seed path so the two can't drift.
+        guard let level = Self.staleLevel(forTimeSinceLastReading: timeSinceLastReading) else { return }
+        let milestoneMinutes: Int = switch level {
+        case .fresh: 0 // unreachable: staleLevel returns nil below the warning threshold
+        case .warning: 5
+        case .stale: 10
+        case .offline: 15
         }
 
-        guard let milestone, session.lastStaleUpdateMinutes != milestone.minutes else { return }
+        guard session.lastStaleUpdateMinutes != milestoneMinutes else { return }
 
-        app.logger.info("📡 \(session.logID) Sending stale update at \(milestone.minutes) minutes")
-        session.lastStaleUpdateMinutes = milestone.minutes
+        app.logger.info("📡 \(session.logID) Sending stale update at \(milestoneMinutes) minutes")
+        session.lastStaleUpdateMinutes = milestoneMinutes
 
         let readings = session.readings ?? [lastReading]
         for token in session.tokens {
@@ -386,7 +390,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 sessionStartDate: session.sessionStartDate,
                 tokenStartDate: token.startDate,
                 tokenCount: session.tokens.count,
-                staleLevel: milestone.level,
+                staleLevel: level,
                 reason: reason,
                 pushToStartAvailable: token.pushToStartToken != nil,
                 logID: session.logID
@@ -881,6 +885,17 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         )
     }
 
+    /// Maps the time since the last reading to a stale level, matching the milestone
+    /// thresholds used for stale updates. Returns nil when the reading is still fresh
+    /// (< 5 minutes), which clients render as live.
+    static func staleLevel(forTimeSinceLastReading interval: TimeInterval) -> LiveActivityState.StaleLevel? {
+        let minutes = Int(interval / 60)
+        if minutes >= 15 { return .offline }
+        if minutes >= 10 { return .stale }
+        if minutes >= 5 { return .warning }
+        return nil
+    }
+
     /// Starts a fresh Live Activity on the same device via push-to-start. The app observes
     /// `activityUpdates`, captures the new activity's update token, and re-registers with
     /// the server — which creates a new session with a fresh time limit.
@@ -890,6 +905,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         environment: PushEnvironment,
         attributesType: String,
         attributes: JSONValue?,
+        latestReading: GlucoseReading?,
+        readings: [GlucoseReading],
+        sessionStartDate: Date?,
+        tokenCount: Int,
+        now: Date,
         logID: String
     ) async {
         let apnsClient = switch environment {
@@ -897,9 +917,35 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         case .production: await app.apns.client(.production)
         }
 
-        // Minimal initial content; the new session pushes real readings within seconds.
-        let state = LiveActivityState(c: nil, h: [], se: false, pd: Date.now)
-        let staleDate = Int(Date.now.addingTimeInterval(offlineInterval).timeIntervalSince1970)
+        // Seed the new activity with the last cached reading so it renders real data
+        // immediately instead of flashing "offline" until the restarted session's first
+        // poll push lands a few seconds later. Compute staleness honestly from the
+        // reading's age so a stale cache isn't presented as live.
+        let state: LiveActivityState
+        let staleDate: Int
+        if let latestReading {
+            state = LiveActivityState(
+                c: latestReading,
+                h: readings.map { .init(t: $0.date, v: Int16($0.value)) },
+                se: false,
+                s: staleLevel(forTimeSinceLastReading: now.timeIntervalSince(latestReading.date)),
+                sd: sessionStartDate,
+                td: now,
+                tc: tokenCount,
+                pd: now,
+                ps: true
+            )
+            // Mirror sendActivityPush: the offline-at instant for this reading, floored to
+            // a small buffer so it's never in the past or near-now.
+            let computedStaleDate = latestReading.date.addingTimeInterval(offlineInterval)
+            let minStaleDate = now.addingTimeInterval(minStaleDateBuffer)
+            staleDate = Int(max(computedStaleDate, minStaleDate).timeIntervalSince1970)
+        } else {
+            // No cached reading (rare); fall back to minimal content. The new session
+            // pushes real readings within seconds.
+            state = LiveActivityState(c: nil, h: [], se: false, pd: now)
+            staleDate = Int(now.addingTimeInterval(offlineInterval).timeIntervalSince1970)
+        }
 
         let notification = APNSStartLiveActivityNotification(
             // Give APNs a real expiration (not .immediately) so it stores and retries the
@@ -909,7 +955,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             priority: .immediately,
             appID: appBundleID,
             contentState: state,
-            timestamp: Int(Date.now.timeIntervalSince1970),
+            timestamp: Int(now.timeIntervalSince1970),
             staleDate: staleDate,
             apnsID: nil,
             attributes: attributes ?? .object([:]),
