@@ -735,19 +735,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         )
     }
 
-    /// Builds a signed delta (e.g. "+5" or "-10") between the latest reading and the
-    /// previous one in the history. Used as a fallback `reason` when none is provided.
-    /// Returns nil when there's no prior reading to compare against.
-    private static func deltaReason(latestReading: GlucoseReading, readings: [GlucoseReading]) -> String? {
-        guard let previous = readings
-            .filter({ $0.date < latestReading.date })
-            .max(by: { $0.date < $1.date })
-        else { return nil }
-
-        let delta = latestReading.value - previous.value
-        return delta >= 0 ? "+\(delta)" : "\(delta)"
-    }
-
     private func sendActivityPush(
         app: Application,
         pushToken: LiveActivityPushToken,
@@ -767,10 +754,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         case .production: await app.apns.client(.production)
         }
 
-        // When no explicit reason is supplied, fall back to the change from the previous
-        // reading (e.g. "+5" or "-10") so the debug field always carries useful context.
-        let resolvedReason = reason ?? Self.deltaReason(latestReading: latestReading, readings: readings)
-
         let state = LiveActivityState(
             c: latestReading,
             h: readings.map { .init(t: $0.date, v: Int16($0.value)) },
@@ -780,7 +763,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             td: tokenStartDate,
             tc: tokenCount,
             pd: Date.now,
-            r: resolvedReason,
+            r: reason,
             ps: pushToStartAvailable
         )
 
