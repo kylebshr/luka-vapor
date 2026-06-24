@@ -36,7 +36,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     // Max lifetime of a Live Activity before the server ends it. Supported by all builds.
-    static let maximumDuration: TimeInterval = 60 * 60 * 7 // 7h
+    static func maximumDuration(for username: String) -> TimeInterval {
+        if username.starts(with: "kylebshr") {
+            8 * 60
+        } else {
+            60 * 60 * 7 // 7h
+        }
+    }
     static let backoff: TimeInterval = 2.0
     static let errorBackoff: TimeInterval = 3
     static let decodingErrorRetryLimit = 10
@@ -151,7 +157,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             // 1. Per-token expiry: remove tokens past their max duration, send end to each.
             var expiredTokens: [LiveActivityTokenEntry] = []
             session.tokens.removeAll { token in
-                let duration = Self.maximumDuration
+                let duration = Self.maximumDuration(for: username)
 
                 // Expire relative to when the activity actually started. startDate is
                 // preserved across push-token rotations (matched by activityID), so it
