@@ -1,6 +1,5 @@
 import Foundation
 import Dexcom
-import Logging
 @preconcurrency import Redis
 
 /// One entry per Live Activity in a poll session.
@@ -108,7 +107,6 @@ enum LiveActivityPollKeys {
 
     static let credField = "cred"
     static let stateField = "state"
-    static let legacyField = "data"
     static let tokenFieldPrefix = "tok:"
     static let dataKeyPrefix = "live-activities:poll:"
 
@@ -199,10 +197,8 @@ enum LiveActivityPollKeys {
         _ = try await client.hdel(tokenField(activityID), from: dataKey(for: username)).get()
     }
 
-    /// Loads and reassembles a full session from its fields. Falls back to the legacy
-    /// single-blob `data` field for sessions written before per-field storage, migrating
-    /// them into the new layout on read so they're not dropped on deploy.
-    static func loadSession(for username: String, on client: any RedisClient, logger: Logger? = nil) async throws -> LoadedSession {
+    /// Loads and reassembles a full session from its per-field hash.
+    static func loadSession(for username: String, on client: any RedisClient) async throws -> LoadedSession {
         let key = dataKey(for: username)
         let raw = try await client.send(command: "HGETALL", with: [RESPValue(from: key.rawValue)]).get()
         guard let array = raw.array, !array.isEmpty else { return .missing }
@@ -214,32 +210,6 @@ enum LiveActivityPollKeys {
                 fields[name] = value
             }
             index += 2
-        }
-
-        // Legacy migration: an old whole-session blob with no per-field data yet. Done as a
-        // single multi-field write (+ one EXPIRE, one HDEL) so it's cheap and idempotent —
-        // important because loadSession is also called from the constantly-polled
-        // glucose-readings GET, and concurrent callers just repeat the same writes.
-        if fields[stateField] == nil, let legacy = fields[legacyField] {
-            guard let session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(legacy.utf8)) else {
-                logger?.warning("🔀 \(username.redactedEmailLogID) Legacy session blob failed to decode, treating as undecodable")
-                return .undecodable
-            }
-            logger?.info("🔀 \(session.logID) Migrating legacy session blob → per-field (\(session.tokens.count) token(s))")
-            var newFields: [String: String] = [
-                credField: try encodeJSON(Cred(password: session.password, accountLocation: session.accountLocation)),
-                stateField: try encodeJSON(State(from: session)),
-            ]
-            for token in session.tokens {
-                newFields[tokenField(token.activityID)] = try encodeJSON(token)
-            }
-            try await client.hmset(newFields, in: key).get()
-            try await refreshTTL(for: key, on: client)
-            _ = try await client.hdel(legacyField, from: key).get()
-            // The HDEL above only returns after the write lands, so reaching here means the
-            // per-field fields are written and the legacy blob is gone — migration succeeded.
-            logger?.info("✅ \(session.logID) Migrated legacy session (\(session.tokens.count) token(s))")
-            return .present(session)
         }
 
         guard let credString = fields[credField], let stateString = fields[stateField] else {

@@ -111,7 +111,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             // throws instead and is caught below WITHOUT removal, so a blip can't delete
             // live sessions.
             var session: LiveActivityPollSession
-            switch try await LiveActivityPollKeys.loadSession(for: username, on: app.redis, logger: app.logger) {
+            switch try await LiveActivityPollKeys.loadSession(for: username, on: app.redis) {
             case .present(let loaded):
                 session = loaded
             case .missing:

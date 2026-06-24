@@ -25,7 +25,7 @@ func routes(_ app: Application) throws {
             return Response(status: .unauthorized)
         }
 
-        guard case .present(let session) = try await LiveActivityPollKeys.loadSession(for: auth.username, on: req.redis, logger: req.logger),
+        guard case .present(let session) = try await LiveActivityPollKeys.loadSession(for: auth.username, on: req.redis),
               session.password == auth.password,
               let cached = session.readings, !cached.isEmpty
         else {
@@ -84,7 +84,7 @@ func routes(_ app: Application) throws {
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        let loaded = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis, logger: req.logger)
+        let loaded = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis)
 
         // Determine whether this is a brand-new session and, if the activity is
         // re-registering after a push-token rotation, find its original entry so we can
@@ -189,7 +189,7 @@ func routes(_ app: Application) throws {
     app.post("restart-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(DebugRestartLiveActivityRequest.self)
 
-        guard case .present(let session) = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis, logger: req.logger) else {
+        guard case .present(let session) = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis) else {
             req.logger.warning("🔁 \(body.logID) No session found to restart")
             throw Abort(.notFound, reason: "No session found")
         }
