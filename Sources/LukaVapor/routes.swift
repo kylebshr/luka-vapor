@@ -73,6 +73,20 @@ func routes(_ app: Application) throws {
     app.post("end-live-activities") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivitiesRequest.self)
 
+        // Send an end push to every active token first — removeSession only deletes Redis
+        // state, so without this the activities linger on-device until their own stale
+        // timeout instead of being dismissed now. dismiss: true clears them immediately.
+        if case .present(let session) = try? await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis) {
+            for token in session.tokens {
+                await LiveActivityScheduler.sendEndEvent(
+                    app: req.application,
+                    pushToken: token.pushToken,
+                    environment: token.environment,
+                    dismiss: true
+                )
+            }
+        }
+
         // Explicit "end everything for this user" — tear the whole session down.
         try await LiveActivityPollKeys.removeSession(body.username, on: req.redis)
 
