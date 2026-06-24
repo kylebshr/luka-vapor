@@ -154,6 +154,43 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
+            // Poll Dexcom up front so the push-to-start seed below — and the client-facing
+            // cached /glucose-readings endpoint, which both read session.readings — reflect
+            // the freshest reading rather than the previous tick's cache. Previously the poll
+            // ran only after expiry handling (and not at all when the session was torn down),
+            // so an hour-7 restart seeded a stale value. The result is reused by
+            // pollAndUpdate, so the common path makes no extra Dexcom call; only a session
+            // that fully expires this tick incurs one poll it would otherwise have skipped.
+            let sessionCapture = SessionCapture()
+            let client = DexcomClient(
+                username: session.username,
+                password: session.password,
+                existingAccountID: session.accountID,
+                existingSessionID: session.sessionID,
+                accountLocation: session.accountLocation
+            )
+            await client.setDelegate(sessionCapture)
+
+            let pollResult: Result<[GlucoseReading], any Error>
+            do {
+                app.logger.info("🔄 \(session.logID) Checking for new readings")
+                let readings = try await client.getGlucoseReadings(
+                    duration: .init(value: 24, unit: .hours)
+                ).sorted { $0.date < $1.date }
+                pollResult = .success(readings)
+            } catch {
+                pollResult = .failure(error)
+            }
+
+            // Seed restarts from the fresh poll; fall back to the cache if it failed or was
+            // empty so a poll blip never seeds an emptier activity than before.
+            let polledReadings = try? pollResult.get()
+            let hasFreshReadings = !(polledReadings?.isEmpty ?? true)
+            let seedReadings = hasFreshReadings
+                ? polledReadings!
+                : (session.readings ?? session.lastReading.map { [$0] } ?? [])
+            let seedLatestReading = hasFreshReadings ? polledReadings!.last : session.lastReading
+
             // 1. Per-token expiry: remove tokens past their max duration, send end to each.
             var expiredTokens: [LiveActivityTokenEntry] = []
             session.tokens.removeAll { token in
@@ -194,15 +231,14 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     dismiss: willRestart
                 )
                 if let restartInfo {
-                    let cachedReadings = session.readings ?? session.lastReading.map { [$0] } ?? []
                     await Self.sendStartEvent(
                         app: app,
                         pushToStartToken: restartInfo.token,
                         environment: token.environment,
                         attributesType: restartInfo.type,
                         attributes: restartInfo.attributes,
-                        latestReading: session.lastReading,
-                        readings: trim(readings: cachedReadings, toDuration: token.duration, now: now),
+                        latestReading: seedLatestReading,
+                        readings: trim(readings: seedReadings, toDuration: token.duration, now: now),
                         sessionStartDate: session.sessionStartDate,
                         tokenCount: session.tokens.count,
                         now: now,
@@ -223,30 +259,29 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            // 2. Poll Dexcom and process result
-            await pollAndUpdate(app: app, session: &session, now: now)
+            // 2. Process the poll performed above
+            await pollAndUpdate(
+                app: app,
+                session: &session,
+                now: now,
+                pollResult: pollResult,
+                sessionCapture: sessionCapture
+            )
 
         } catch {
             app.logger.error("Error processing session \(username.prefix(8))...: \(error)")
         }
     }
 
-    private func pollAndUpdate(app: Application, session: inout LiveActivityPollSession, now: Date) async {
-        let sessionCapture = SessionCapture()
-        let client = DexcomClient(
-            username: session.username,
-            password: session.password,
-            existingAccountID: session.accountID,
-            existingSessionID: session.sessionID,
-            accountLocation: session.accountLocation
-        )
-        await client.setDelegate(sessionCapture)
-
+    private func pollAndUpdate(
+        app: Application,
+        session: inout LiveActivityPollSession,
+        now: Date,
+        pollResult: Result<[GlucoseReading], any Error>,
+        sessionCapture: SessionCapture
+    ) async {
         do {
-            app.logger.info("🔄 \(session.logID) Checking for new readings")
-            let readings = try await client.getGlucoseReadings(
-                duration: .init(value: 24, unit: .hours)
-            ).sorted { $0.date < $1.date }
+            let readings = try pollResult.get()
 
             guard let latestReading = readings.last else {
                 app.logger.warning("🛑 \(session.logID) No readings available")
