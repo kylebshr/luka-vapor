@@ -97,32 +97,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return usernames
     }
 
-    /// The outcome of trying to load a session's data hash. We distinguish an undecodable
-    /// hash (deterministic poison — must be removed) from a transient Redis error (which
-    /// throws and must NOT trigger removal, or a blip would delete live sessions).
-    private enum LoadedSession {
-        case present(LiveActivityPollSession)
-        case missing
-        case undecodable
-    }
-
-    private func loadSession(app: Application, username: String) async throws -> LoadedSession {
-        let key = LiveActivityPollKeys.dataKey(for: username)
-        guard let jsonString = try await app.redis.hget("data", from: key, as: String.self).get() else {
-            return .missing
-        }
-        do {
-            return .present(try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)))
-        } catch {
-            app.logger.warning("🧟 \(username.prefix(8))... session data failed to decode: \(error)")
-            return .undecodable
-        }
-    }
-
-    private func saveSession(app: Application, session: LiveActivityPollSession) async throws {
-        try await LiveActivityPollKeys.saveSession(session, on: app.redis)
-    }
-
     private func removeSession(app: Application, username: String) async {
         try? await LiveActivityPollKeys.removeSession(username, on: app.redis)
     }
@@ -137,7 +111,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             // throws instead and is caught below WITHOUT removal, so a blip can't delete
             // live sessions.
             var session: LiveActivityPollSession
-            switch try await loadSession(app: app, username: username) {
+            switch try await LiveActivityPollKeys.loadSession(for: username, on: app.redis, logger: app.logger) {
             case .present(let loaded):
                 session = loaded
             case .missing:
@@ -251,11 +225,16 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     "token_prefix": String(token.pushToken.rawValue.prefix(8)),
                     "reason": willRestart ? "max_duration_restarted" : "max_duration",
                 ])
+                // Drop this device's token field. Targeted HDEL leaves every other device's
+                // token — including one that registered during this tick's poll — untouched.
+                try? await LiveActivityPollKeys.removeToken(for: username, activityID: token.activityID, on: app.redis)
             }
 
             if session.tokens.isEmpty {
                 app.logger.info("🛑 \(session.logID) All tokens expired, removing session")
-                await removeSession(app: app, username: username)
+                // Only tears down if no token field remains — a device that registered during
+                // the poll keeps the session alive for the next tick.
+                _ = try? await LiveActivityPollKeys.pruneSession(for: username, on: app.redis)
                 return
             }
 
@@ -633,7 +612,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let nextTimestamp = Date().addingTimeInterval(delay).timeIntervalSince1970
 
         do {
-            try await saveSession(app: app, session: session)
+            // Persist only the scheduler-owned polling state. The token fields are left
+            // exactly as they are in Redis, so a device that registered during the poll is
+            // never overwritten — it's already stored as its own field and will be picked up
+            // on the next load.
+            try await LiveActivityPollKeys.saveState(for: session.username, from: session, on: app.redis)
 
             _ = try await app.redis.zadd(
                 (element: session.username, score: nextTimestamp),
@@ -680,9 +663,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "token_prefix": String(token.pushToken.rawValue.prefix(8)),
                 "reason": reason.rawValue,
             ])
+            // Drop each ended token's field individually...
+            try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, on: app.redis)
         }
 
-        await removeSession(app: app, username: session.username)
+        // ...then tear down the session only if no token registered during this tick.
+        _ = try? await LiveActivityPollKeys.pruneSession(for: session.username, on: app.redis)
 
         app.logger.info("🛑 \(session.logID) Session ended (\(session.tokens.count) tokens): \(reason.rawValue)")
     }
@@ -757,14 +743,18 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             }
         }
 
-        // Remove invalid tokens
+        // Remove invalid tokens — drop each one's field individually so valid devices (and
+        // any that registered during this poll) are untouched.
         if !tokensToRemove.isEmpty {
+            for token in session.tokens where tokensToRemove.contains(token.pushToken) {
+                try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, on: app.redis)
+            }
             session.tokens.removeAll { tokensToRemove.contains($0.pushToken) }
         }
 
         if session.tokens.isEmpty {
             app.logger.info("🛑 \(session.logID) All tokens invalid, removing session")
-            await removeSession(app: app, username: session.username)
+            _ = try? await LiveActivityPollKeys.pruneSession(for: session.username, on: app.redis)
             return
         }
 

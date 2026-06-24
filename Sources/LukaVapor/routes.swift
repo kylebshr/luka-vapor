@@ -2,9 +2,18 @@ import Vapor
 import Redis
 import Dexcom
 
+// Returned by the activity-count endpoint; the type itself lives in the (Vapor-free) model.
+extension LiveActivityPollKeys.ActivityCounts: Content {}
+
 func routes(_ app: Application) throws {
     app.get { req async in
         "Download Luka on the App Store."
+    }
+
+    // Unauthenticated status: how many sessions are being polled and how many Live
+    // Activities (one per device token) are currently running.
+    app.get("activity-count") { req async throws -> LiveActivityPollKeys.ActivityCounts in
+        try await LiveActivityPollKeys.countActivities(on: req.redis)
     }
 
     app.get("glucose-readings") { req async throws -> Response in
@@ -16,9 +25,7 @@ func routes(_ app: Application) throws {
             return Response(status: .unauthorized)
         }
 
-        let dataKey = LiveActivityPollKeys.dataKey(for: auth.username)
-        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
-              let session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)),
+        guard case .present(let session) = try await LiveActivityPollKeys.loadSession(for: auth.username, on: req.redis, logger: req.logger),
               session.password == auth.password,
               let cached = session.readings, !cached.isEmpty
         else {
@@ -48,28 +55,16 @@ func routes(_ app: Application) throws {
     app.post("end-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivityRequest.self)
 
-        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
+        // Remove just this device's token field — keyed by the stable activityID, since the
+        // push token may have rotated since the client last saw it. The HDEL and the
+        // "any tokens left?" teardown check run in one atomic script, so a device registering
+        // concurrently can't be wrongly dropped or leave an orphan session behind.
+        let removed = try await LiveActivityPollKeys.pruneSession(for: body.username, removingActivityID: body.activityID, on: req.redis)
 
-        // Load existing session
-        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get() else {
-            req.logger.warning("⏹️  No session found for \(body.username.prefix(8))...")
-            return .ok
-        }
-
-        var session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
-
-        // Remove the matching entry by its stable activityID — the push token may have
-        // rotated since the client last saw it, so it's not a reliable key.
-        session.tokens.removeAll { $0.activityID == body.activityID }
-
-        if session.tokens.isEmpty {
-            // No tokens left — clean up entirely
-            try await LiveActivityPollKeys.removeSession(body.username, on: req.redis)
-            req.logger.info("⏹️  \(session.logID) Ended last token, removed session")
+        if removed {
+            req.logger.info("⏹️  \(body.username.redactedEmailLogID) Ended last token, removed session")
         } else {
-            // Save updated session
-            try await LiveActivityPollKeys.saveSession(session, on: req.redis)
-            req.logger.info("⏹️  \(session.logID) Removed token, \(session.tokens.count) remaining")
+            req.logger.info("⏹️  \(body.username.redactedEmailLogID) Removed token")
         }
 
         return .ok
@@ -78,19 +73,10 @@ func routes(_ app: Application) throws {
     app.post("end-live-activities") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivitiesRequest.self)
 
-        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
-
-        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get() else {
-            req.logger.warning("⏹️  No session found for \(body.logID)")
-            return .ok
-        }
-
-        let session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
-        let tokenCount = session.tokens.count
-
+        // Explicit "end everything for this user" — tear the whole session down.
         try await LiveActivityPollKeys.removeSession(body.username, on: req.redis)
 
-        req.logger.info("⏹️  \(session.logID) Ended all sessions (\(tokenCount) tokens removed)")
+        req.logger.info("⏹️  \(body.logID) Ended all sessions")
 
         return .ok
     }
@@ -98,79 +84,48 @@ func routes(_ app: Application) throws {
     app.post("start-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
-        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
+        let loaded = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis, logger: req.logger)
+
+        // Determine whether this is a brand-new session and, if the activity is
+        // re-registering after a push-token rotation, find its original entry so we can
+        // preserve the start date — otherwise the activity's lifetime would reset on every
+        // refresh.
+        let existingSession: LiveActivityPollSession?
+        switch loaded {
+        case .present(let session): existingSession = session
+        case .missing, .undecodable: existingSession = nil
+        }
+        let existingToken = existingSession?.tokens.first { $0.activityID == body.activityID }
 
         let tokenEntry = LiveActivityTokenEntry(
             pushToken: body.pushToken,
             environment: body.environment,
             preferences: body.preferences,
-            startDate: Date.now,
+            // Preserve the original start date across push-token rotations (matched by
+            // activityID); only a genuinely new activity starts its clock now.
+            startDate: existingToken?.startDate ?? Date.now,
             duration: body.duration,
             activityID: body.activityID,
+            // Push-to-start info is taken from this call verbatim so the client can opt out
+            // by sending nil — there's no merge with a stored value.
             pushToStartToken: body.pushToStartToken,
             attributesType: body.attributesType,
             attributes: body.attributes
         )
 
-        // Try to load an existing session for this username
-        if let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get(),
-           var session = try? JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8)) {
+        // Persist this device's token as its own field. Because it's an isolated HSET, a
+        // second device registering at the same moment can't clobber it (the bug where one
+        // of two simultaneous push-to-start registrations was silently dropped).
+        try await LiveActivityPollKeys.saveCred(
+            for: body.username,
+            password: body.password,
+            accountLocation: body.accountLocation,
+            on: req.redis
+        )
+        try await LiveActivityPollKeys.saveToken(for: body.username, tokenEntry, on: req.redis)
 
-            // Find the existing entry for this activity by its stable activityID, which
-            // survives push-token rotation: a rotated token updates the existing entry
-            // instead of creating a duplicate that resets the activity's lifetime.
-            let existingIndex = session.tokens.firstIndex { $0.activityID == body.activityID }
-
-            // Replace the existing entry or append a new one. When replacing, preserve the
-            // original start date so the activity's lifetime isn't reset on every refresh —
-            // only the push token and other fields are updated.
-            if let index = existingIndex {
-                session.tokens[index] = LiveActivityTokenEntry(
-                    pushToken: tokenEntry.pushToken,
-                    environment: tokenEntry.environment,
-                    preferences: tokenEntry.preferences,
-                    startDate: session.tokens[index].startDate,
-                    duration: tokenEntry.duration,
-                    activityID: tokenEntry.activityID,
-                    // Take push-to-start info from the latest call verbatim (no fallback to the
-                    // stored value): the client re-registers whenever its push-to-start token
-                    // arrives or changes, so honoring exactly what it sends lets the user opt
-                    // out — sending nil clears a previously stored token instead of pinning it.
-                    pushToStartToken: tokenEntry.pushToStartToken,
-                    attributesType: tokenEntry.attributesType,
-                    attributes: tokenEntry.attributes
-                )
-            } else {
-                session.tokens.append(tokenEntry)
-            }
-
-            // Update credentials to latest
-            session.password = body.password
-            session.accountID = body.accountID ?? session.accountID
-            session.sessionID = body.sessionID ?? session.sessionID
-
-            try await LiveActivityPollKeys.saveSession(session, on: req.redis)
-
-            // Ensure a schedule entry exists. If a prior race or partial failure left this
-            // session orphaned (data hash present, no schedule entry), the scheduler never
-            // polls it and the activity gets stuck — NX heals it without disturbing an
-            // already-scheduled score.
-            _ = try await req.redis.zadd(
-                (element: body.username, score: Date.now.timeIntervalSince1970),
-                to: LiveActivityPollKeys.scheduleKey,
-                inserting: .onlyNewElements
-            ).get()
-
-            req.logger.info("🆕 \(body.logID) Added token to existing session (\(session.tokens.count) tokens)")
-            app.axiom?.emit("session_started", attributes: [
-                "user": body.logID,
-                "environment": body.environment.rawValue,
-                "token_prefix": String(body.pushToken.rawValue.prefix(8)),
-                "kind": "token_added",
-                "token_count": String(session.tokens.count),
-            ])
-        } else {
-            // Create new session
+        if existingSession == nil {
+            // New session: seed the scheduler-owned polling state, then schedule immediately.
             let session = LiveActivityPollSession(
                 username: body.username,
                 password: body.password,
@@ -182,13 +137,10 @@ func routes(_ app: Application) throws {
                 pollInterval: LiveActivityScheduler.minInterval,
                 retryCount: 0
             )
+            try await LiveActivityPollKeys.saveState(for: body.username, from: session, on: req.redis)
 
-            try await LiveActivityPollKeys.saveSession(session, on: req.redis)
-
-            // Add to schedule sorted set (immediate execution)
-            let nowTimestamp = Date.now.timeIntervalSince1970
             _ = try await req.redis.zadd(
-                (element: body.username, score: nowTimestamp),
+                (element: body.username, score: Date.now.timeIntervalSince1970),
                 to: LiveActivityPollKeys.scheduleKey
             ).get()
 
@@ -199,6 +151,30 @@ func routes(_ app: Application) throws {
                 "token_prefix": String(body.pushToken.rawValue.prefix(8)),
                 "kind": "new",
                 "token_count": "1",
+            ])
+        } else {
+            // Existing session: don't touch the scheduler-owned state. Ensure a schedule
+            // entry exists — if a prior race or partial failure left this session orphaned
+            // (hash present, no schedule entry), the scheduler never polls it; NX heals it
+            // without disturbing an already-scheduled score.
+            _ = try await req.redis.zadd(
+                (element: body.username, score: Date.now.timeIntervalSince1970),
+                to: LiveActivityPollKeys.scheduleKey,
+                inserting: .onlyNewElements
+            ).get()
+
+            // Token count is best-effort for logging — derived from the pre-write snapshot.
+            let tokenCount = (existingToken == nil)
+                ? (existingSession!.tokens.count + 1)
+                : existingSession!.tokens.count
+
+            req.logger.info("🆕 \(body.logID) Added token to existing session (\(tokenCount) tokens)")
+            app.axiom?.emit("session_started", attributes: [
+                "user": body.logID,
+                "environment": body.environment.rawValue,
+                "token_prefix": String(body.pushToken.rawValue.prefix(8)),
+                "kind": "token_added",
+                "token_count": String(tokenCount),
             ])
         }
 
@@ -213,13 +189,10 @@ func routes(_ app: Application) throws {
     app.post("restart-live-activity") { req async throws -> HTTPStatus in
         let body = try req.content.decode(DebugRestartLiveActivityRequest.self)
 
-        let dataKey = LiveActivityPollKeys.dataKey(for: body.username)
-        guard let jsonString = try await req.redis.hget("data", from: dataKey, as: String.self).get() else {
+        guard case .present(let session) = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis, logger: req.logger) else {
             req.logger.warning("🔁 \(body.logID) No session found to restart")
             throw Abort(.notFound, reason: "No session found")
         }
-
-        let session = try JSONDecoder().decode(LiveActivityPollSession.self, from: Data(jsonString.utf8))
 
         // Match the token by its stable activityID, the same way end-live-activity does.
         let token = session.tokens.first { $0.activityID == body.activityID }
