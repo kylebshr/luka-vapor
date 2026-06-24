@@ -28,6 +28,14 @@ struct LiveActivityTokenEntry: Codable, Sendable {
     let pushToStartToken: String?
     let attributesType: String?
     let attributes: JSONValue?
+
+    /// Whether this activity can be relaunched via push-to-start. True only when the client
+    /// opted in and sent all three pieces needed to recreate the activity on-device — a start
+    /// push with a missing/empty attributes object would fail to decode into the activity's
+    /// ActivityAttributes.
+    var canRestartViaPushToStart: Bool {
+        pushToStartToken != nil && attributesType != nil && attributes != nil
+    }
 }
 
 /// One per username — holds shared Dexcom polling state and all device tokens.
