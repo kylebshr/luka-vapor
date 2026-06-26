@@ -653,11 +653,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     }
 
     /// Relaunch a fresh Live Activity on this device via push-to-start, seeded with the
-    /// latest reading. Used both when an activity hits its max duration and when its update
-    /// token expires mid-session. A no-op (returns false) if the client didn't opt into
-    /// push-to-start. Does NOT send an end event — callers that need to dismiss a still-live
-    /// activity first (the max-duration path) send their own end event; an expired token has
-    /// no activity left to end.
+    /// latest reading. Used when an activity hits its max duration. A no-op (returns false)
+    /// if the client didn't opt into push-to-start. Does NOT send an end event — the
+    /// max-duration caller dismisses the still-live activity with its own end event first.
     @discardableResult
     private func restartViaPushToStart(
         app: Application,
@@ -700,10 +698,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         sessionCapture: SessionCapture
     ) async {
         var tokensToRemove: Set<LiveActivityPushToken> = []
-        // Tokens whose activity vanished (APNS reported it expired/unregistered) and that
-        // opted into push-to-start — relaunch a fresh activity for each so monitoring keeps
-        // going instead of going dark until the user reopens the app.
-        var tokensToRestart: [LiveActivityTokenEntry] = []
 
         for token in session.tokens {
             let alertContent = alert(for: latestReading, lastReading: session.lastReading, preferences: token.preferences)
@@ -734,20 +728,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 app.logger.error("\(session.logID) APNS error for \(tokenPrefix)...: \(error)")
                 let apnsReason = error.reason?.reason ?? "unknown"
                 var willRemove = false
-                var willRestart = false
                 if let reason = error.reason,
                    reason == .badDeviceToken || reason == .unregistered || reason == .expiredToken {
+                    // Drop the token without restarting. An .expiredToken/.unregistered can mean
+                    // the activity genuinely ended, but it also fires when the activity's update
+                    // token merely rotated and we pushed with the previous one before the device
+                    // re-registered the new one — in which case the activity is still alive. We
+                    // can't tell the two apart, so a push-to-start "restart" here risks spawning
+                    // a duplicate live activity alongside one that never went away. Just drop the
+                    // stale token; a real rotation re-registers itself, and a genuinely ended
+                    // activity is correctly gone.
                     app.logger.error("\(session.logID) Removing token \(tokenPrefix)... due to \(reason.reason)")
                     tokensToRemove.insert(token.pushToken)
                     willRemove = true
-                    // .expiredToken / .unregistered mean the activity is genuinely gone from
-                    // the device, so relaunch it if the client opted into push-to-start.
-                    // .badDeviceToken is a malformed/wrong-environment token, not a vanished
-                    // activity — restarting that would risk a duplicate, so leave it dropped.
-                    if (reason == .expiredToken || reason == .unregistered), token.canRestartViaPushToStart {
-                        tokensToRestart.append(token)
-                        willRestart = true
-                    }
                 }
                 app.axiom?.emit("push_failed", attributes: [
                     "user": session.logID,
@@ -757,7 +750,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     "error_type": "apns",
                     "apns_reason": apnsReason,
                     "token_removed": willRemove ? "true" : "false",
-                    "token_restarted": willRestart ? "true" : "false",
                 ])
             } catch {
                 app.logger.error("\(session.logID) Unexpected error sending push to \(tokenPrefix)...: \(error)")
@@ -779,27 +771,6 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, on: app.redis)
             }
             session.tokens.removeAll { tokensToRemove.contains($0.pushToken) }
-        }
-
-        // Relaunch any expired activities that opted into push-to-start. Done before the
-        // empty-session teardown below so a session whose only token just expired still gets
-        // its restart — the new activity re-registers as a fresh session within seconds.
-        for token in tokensToRestart {
-            app.logger.info("🔁 \(session.logID) Token \(token.pushToken.rawValue.prefix(8))... expired, restarting via push-to-start")
-            await restartViaPushToStart(
-                app: app,
-                token: token,
-                session: session,
-                seedLatestReading: latestReading,
-                seedReadings: readings,
-                now: now
-            )
-            app.axiom?.emit("push_ended", attributes: [
-                "user": session.logID,
-                "environment": token.environment.rawValue,
-                "token_prefix": String(token.pushToken.rawValue.prefix(8)),
-                "reason": "expired_token_restarted",
-            ])
         }
 
         if session.tokens.isEmpty {
