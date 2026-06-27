@@ -138,6 +138,24 @@ func routes(_ app: Application) throws {
         )
         try await LiveActivityPollKeys.saveToken(for: body.username, tokenEntry, on: req.redis)
 
+        // A push-to-start token is per-device, so an existing entry sharing this one but
+        // keyed by a different activityID is a stale activity that's been superseded on-device
+        // by the one starting now. Drop those stale entries so the scheduler stops pushing
+        // updates to an activity that no longer exists — otherwise a single device accrues
+        // duplicate tokens and receives redundant pushes. Only the just-saved activityID is
+        // kept; nil push-to-start tokens (opted-out clients) are never matched.
+        let supersededIDs: [String] = body.pushToStartToken.map { pushToStartToken in
+            (existingSession?.tokens ?? [])
+                .filter { $0.pushToStartToken == pushToStartToken && $0.activityID != body.activityID }
+                .map(\.activityID)
+        } ?? []
+        for activityID in supersededIDs {
+            try await LiveActivityPollKeys.removeToken(for: body.username, activityID: activityID, on: req.redis)
+        }
+        if !supersededIDs.isEmpty {
+            req.logger.info("🧹 \(body.logID) Removed \(supersededIDs.count) stale token(s) with same push-to-start token")
+        }
+
         if existingSession == nil {
             // New session: seed the scheduler-owned polling state, then schedule immediately.
             let session = LiveActivityPollSession(
@@ -177,10 +195,11 @@ func routes(_ app: Application) throws {
                 inserting: .onlyNewElements
             ).get()
 
-            // Token count is best-effort for logging — derived from the pre-write snapshot.
+            // Token count is best-effort for logging — derived from the pre-write snapshot,
+            // adjusted for the new token and any superseded entries just removed.
             let tokenCount = (existingToken == nil)
-                ? (existingSession!.tokens.count + 1)
-                : existingSession!.tokens.count
+                ? (existingSession!.tokens.count + 1 - supersededIDs.count)
+                : (existingSession!.tokens.count - supersededIDs.count)
 
             req.logger.info("🆕 \(body.logID) Added token to existing session (\(tokenCount) tokens)")
             app.axiom?.emit("session_started", attributes: [
