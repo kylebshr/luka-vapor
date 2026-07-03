@@ -993,6 +993,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 td: now,
                 tc: tokenCount,
                 pd: now,
+                r: "Restarted",
                 ps: true
             )
             // Mirror sendActivityPush: the offline-at instant for this reading, floored to
@@ -1003,7 +1004,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         } else {
             // No cached reading (rare); fall back to minimal content. The new session
             // pushes real readings within seconds.
-            state = LiveActivityState(c: nil, h: [], se: false, pd: now)
+            state = LiveActivityState(c: nil, h: [], se: false, pd: now, r: "Restarted")
             staleDate = Int(now.addingTimeInterval(offlineInterval).timeIntervalSince1970)
         }
 
