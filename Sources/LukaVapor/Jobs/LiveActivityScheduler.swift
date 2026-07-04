@@ -422,6 +422,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "status_code": "429",
                 "error_code": error.code?.rawValue ?? "unknown",
                 "retry_after": error.httpResponse?.retryAfter.map { String(Int($0)) } ?? "none",
+                "retry_after_header": error.httpResponse?.value(forHTTPHeaderField: "Retry-After") ?? "none",
                 "retry_count": String(session.retryCount),
                 "will_end": "false",
             ])
@@ -444,8 +445,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "endpoint": error.url?.lastPathComponent ?? "unknown",
                 "error": error.errorDescription,
                 // How long Dexcom asked us to wait, when the 429 carried a Retry-After
-                // header — distinguishes header-honoring backoff from our own floor.
+                // header — distinguishes header-honoring backoff from our own floor. The
+                // raw header rides along so "absent" is distinguishable from "unparseable",
+                // and to establish whether Dexcom sends the header at all.
                 "retry_after": error.httpResponse?.retryAfter.map { String(Int($0)) } ?? "none",
+                "retry_after_header": error.httpResponse?.value(forHTTPHeaderField: "Retry-After") ?? "none",
                 "retry_count": String(session.retryCount),
                 "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit) ? "true" : "false",
                 // On a 429, a Cloudflare HTML error page here means edge/per-IP rate
