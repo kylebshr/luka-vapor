@@ -17,8 +17,11 @@ final class AxiomClient: Sendable {
     private let baseURL: String
     private let client: any Client
     private let logger: Logger
+    // Identity attributes (machine, region, shard) stamped on every event so per-egress-IP
+    // queries need no per-call-site plumbing. Event-specific attributes win on key clashes.
+    private let defaultAttributes: [String: String]
 
-    init?(client: any Client, logger: Logger) {
+    init?(client: any Client, logger: Logger, defaultAttributes: [String: String] = [:]) {
         guard let token = Environment.get("AXIOM_TOKEN"),
               let dataset = Environment.get("AXIOM_DATASET") else {
             return nil
@@ -28,12 +31,13 @@ final class AxiomClient: Sendable {
         self.baseURL = Environment.get("AXIOM_URL") ?? "https://api.axiom.co"
         self.client = client
         self.logger = logger
+        self.defaultAttributes = defaultAttributes
     }
 
     /// Emit one event. Fire-and-forget: returns immediately, ships on a detached Task.
     func emit(_ name: String, attributes: [String: String] = [:]) {
         // Axiom auto-timestamps on ingest if `_time` omitted.
-        var payload = attributes
+        var payload = defaultAttributes.merging(attributes) { _, event in event }
         payload["event"] = name
 
         Task { [client, token, dataset, baseURL, logger] in
