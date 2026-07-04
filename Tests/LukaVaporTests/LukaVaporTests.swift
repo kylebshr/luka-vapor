@@ -1,4 +1,5 @@
 @testable import LukaVapor
+import Dexcom
 import VaporTesting
 import Testing
 
@@ -30,6 +31,44 @@ struct LukaVaporTests {
         // With no prior reading to anchor to, fall back to at least the floor.
         let fallback = LiveActivityScheduler.delayUntilNextReading(after: nil, now: overdueNow, minimumDelay: floor)
         #expect(fallback >= floor)
+    }
+
+    @Test("Retry-After extends the rate limit floor past the default")
+    func retryAfterExtendsFloor() {
+        let lastReading = Date()
+        let now = lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval + 20)
+
+        // Dexcom asked for a 10-minute wait — longer than rateLimitMinDelay (4 min), so
+        // the header wins and the reschedule lands on the first reading boundary past it.
+        let response = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "600"])
+        let retryAfter = LiveActivityScheduler.honoredRetryAfter(response)
+        #expect(retryAfter == 600)
+
+        let delay = LiveActivityScheduler.delayUntilNextReading(
+            after: lastReading, now: now, minimumDelay: max(LiveActivityScheduler.rateLimitMinDelay, retryAfter)
+        )
+        #expect(delay >= 600)
+        #expect(delay <= 600 + LiveActivityScheduler.readingInterval)
+
+        // A shorter Retry-After than our own floor doesn't shrink the backoff.
+        let shortResponse = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "30"])
+        let shortFloor = max(LiveActivityScheduler.rateLimitMinDelay, LiveActivityScheduler.honoredRetryAfter(shortResponse))
+        #expect(shortFloor == LiveActivityScheduler.rateLimitMinDelay)
+    }
+
+    @Test("Retry-After is capped and absent headers fall back to 0")
+    func retryAfterCapAndFallback() {
+        // A far-future value can't park a session for hours.
+        let huge = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "86400"])
+        #expect(LiveActivityScheduler.honoredRetryAfter(huge) == LiveActivityScheduler.maxRetryAfter)
+
+        // No header, unparseable header, or no response metadata at all: contribute
+        // nothing, leaving rateLimitMinDelay as the effective floor.
+        let noHeader = DexcomHTTPResponse(statusCode: 429)
+        #expect(LiveActivityScheduler.honoredRetryAfter(noHeader) == 0)
+        let garbage = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "soon"])
+        #expect(LiveActivityScheduler.honoredRetryAfter(garbage) == 0)
+        #expect(LiveActivityScheduler.honoredRetryAfter(nil) == 0)
     }
 
     @Test("Recovery floor decays toward minInterval then clears")
