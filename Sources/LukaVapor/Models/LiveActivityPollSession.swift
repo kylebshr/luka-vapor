@@ -257,24 +257,39 @@ enum LiveActivityPollKeys {
         let sessions: Int
         /// One per device `tok:` field — i.e. each live Activity receiving pushes.
         let activities: Int
+        /// Sessions currently backing off from a Dexcom rate limit (HTTP 429) — those whose
+        /// state carries an active `recoveryInterval` floor, which is set on a 429 and decays
+        /// away once polls are healthy again.
+        let rateLimited: Int
     }
 
-    /// Counts sessions (schedule members) and total running activities (token fields) in a
-    /// single Lua pass, so a status check is one round-trip regardless of user count.
+    /// Counts sessions (schedule members), total running activities (token fields), and
+    /// rate-limited sessions (state with an active recovery floor) in a single Lua pass,
+    /// so a status check is one round-trip regardless of user count.
     static func countActivities(on client: any RedisClient) async throws -> ActivityCounts {
         let script = """
         local members = redis.call('ZRANGE', KEYS[1], 0, -1)
         local prefix = ARGV[1]
         local plen = string.len(prefix)
         local activities = 0
+        local rateLimited = 0
         for _, user in ipairs(members) do
-            for _, name in ipairs(redis.call('HKEYS', ARGV[2] .. user)) do
+            local key = ARGV[2] .. user
+            for _, name in ipairs(redis.call('HKEYS', key)) do
                 if string.sub(name, 1, plen) == prefix then
                     activities = activities + 1
                 end
             end
+            local state = redis.call('HGET', key, ARGV[3])
+            if state then
+                local ok, decoded = pcall(cjson.decode, state)
+                if ok and type(decoded) == 'table'
+                    and decoded[ARGV[4]] ~= nil and decoded[ARGV[4]] ~= cjson.null then
+                    rateLimited = rateLimited + 1
+                end
+            end
         end
-        return {#members, activities}
+        return {#members, activities, rateLimited}
         """
         let result = try await client.send(command: "EVAL", with: [
             RESPValue(from: script),
@@ -282,11 +297,16 @@ enum LiveActivityPollKeys {
             RESPValue(from: scheduleKey.rawValue),
             RESPValue(from: tokenFieldPrefix),
             RESPValue(from: dataKeyPrefix),
+            RESPValue(from: stateField),
+            // JSON key of State.recoveryInterval; JSONEncoder omits it entirely while nil,
+            // so presence (and not cjson.null) means the recovery floor is active.
+            RESPValue(from: "recoveryInterval"),
         ]).get()
         let array = result.array ?? []
         let sessions = array.count > 0 ? (array[0].int ?? 0) : 0
         let activities = array.count > 1 ? (array[1].int ?? 0) : 0
-        return ActivityCounts(sessions: sessions, activities: activities)
+        let rateLimited = array.count > 2 ? (array[2].int ?? 0) : 0
+        return ActivityCounts(sessions: sessions, activities: activities, rateLimited: rateLimited)
     }
 
     /// Atomically removes the schedule entry and the entire hash for a username.

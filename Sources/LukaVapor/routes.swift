@@ -10,8 +10,9 @@ func routes(_ app: Application) throws {
         "Download Luka on the App Store."
     }
 
-    // Unauthenticated status: how many sessions are being polled and how many Live
-    // Activities (one per device token) are currently running.
+    // Unauthenticated status: how many sessions are being polled, how many Live
+    // Activities (one per device token) are currently running, and how many sessions
+    // are currently backing off from a Dexcom rate limit.
     app.get("activity-count") { req async throws -> LiveActivityPollKeys.ActivityCounts in
         try await LiveActivityPollKeys.countActivities(on: req.redis)
     }
