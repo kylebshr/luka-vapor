@@ -71,6 +71,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // On a 429, never reschedule sooner than this. A reading about to land would just get
     // rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
     static let rateLimitMinDelay: TimeInterval = 60 * 4 // 4 min
+    // Longest server-provided Retry-After we'll honor. The header is authoritative for
+    // when the limit clears, but a malformed or far-future value shouldn't park a
+    // session past the point where its Live Activity has any data worth resuming.
+    static let maxRetryAfter: TimeInterval = 60 * 30 // 30 min
     // Small random spread added to error/overdue reschedules. A cohort synchronized by a
     // shared event (a Dexcom outage erroring many sessions in one tick) computes its next
     // delay from a shared "now" and would otherwise re-poll in lockstep until fresh
@@ -286,6 +290,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 (readings.isEmpty ? "empty" : "success", "200", "readings")
             case .failure(let error as DexcomDecodingError):
                 ("error", error.statusCode?.description ?? "unknown", error.url?.lastPathComponent ?? "unknown")
+            case .failure(let error as DexcomError):
+                ("error", error.httpResponse?.statusCode.description ?? "unknown", error.httpResponse?.url?.lastPathComponent ?? "unknown")
             case .failure:
                 ("error", "unknown", "unknown")
             }
@@ -405,6 +411,28 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "will_end": "true",
             ])
             await endAllTokens(app: app, session: session, reason: .dexcomError)
+        } catch let error as DexcomError where error.httpResponse?.statusCode == 429 {
+            // A rate limit whose body decoded as a Dexcom JSON error (app-level limiting,
+            // vs. the Cloudflare HTML pages that surface as DexcomDecodingError). Back off
+            // the same way instead of falling through to the generic handler, which retries
+            // on the normal cadence and ends the session after a few attempts.
+            app.axiom?.emit("poll_error", attributes: [
+                "user": session.logID,
+                "error_type": "dexcom",
+                "status_code": "429",
+                "error_code": error.code?.rawValue ?? "unknown",
+                "retry_after": error.httpResponse?.retryAfter.map { String(Int($0)) } ?? "none",
+                "retry_after_header": error.httpResponse?.value(forHTTPHeaderField: "Retry-After") ?? "none",
+                "retry_count": String(session.retryCount),
+                "will_end": "false",
+            ])
+            await rescheduleAfterRateLimit(
+                app: app,
+                session: &session,
+                httpResponse: error.httpResponse,
+                sessionCapture: sessionCapture
+            )
+            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "Rate limited")
         } catch let error as DexcomDecodingError {
             app.axiom?.emit("poll_error", attributes: [
                 "user": session.logID,
@@ -416,6 +444,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 // (readings), AuthenticatePublisherAccount (auth), LoginPublisherAccountById (login).
                 "endpoint": error.url?.lastPathComponent ?? "unknown",
                 "error": error.errorDescription,
+                // How long Dexcom asked us to wait, when the 429 carried a Retry-After
+                // header — distinguishes header-honoring backoff from our own floor. The
+                // raw header rides along so "absent" is distinguishable from "unparseable",
+                // and to establish whether Dexcom sends the header at all.
+                "retry_after": error.httpResponse?.retryAfter.map { String(Int($0)) } ?? "none",
+                "retry_after_header": error.httpResponse?.value(forHTTPHeaderField: "Retry-After") ?? "none",
                 "retry_count": String(session.retryCount),
                 "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit) ? "true" : "false",
                 // On a 429, a Cloudflare HTML error page here means edge/per-IP rate
@@ -501,40 +535,70 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         if session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit {
             app.logger.error("🤬 \(session.logID) Done retrying due to errors, ending all tokens")
             await endAllTokens(app: app, session: session, reason: .tooManyRetries)
+        } else if error.statusCode == 429 {
+            await rescheduleAfterRateLimit(
+                app: app,
+                session: &session,
+                httpResponse: error.httpResponse,
+                sessionCapture: sessionCapture
+            )
         } else {
-            let nextPollInterval = min(session.pollInterval * Self.errorBackoff, Self.maxInterval)
-            let delay: TimeInterval = if error.statusCode == 429 {
-                // Queue the next poll for a reading boundary at least rateLimitMinDelay out,
-                // skipping any reading about to land — retrying right before it just
-                // re-triggers the 429.
-                Self.delayUntilNextReading(
-                    after: session.lastReadingDate,
-                    now: Date(),
-                    minimumDelay: Self.rateLimitMinDelay
-                )
-            } else {
-                Self.jittered(session.pollInterval)
-            }
-
-            if error.statusCode == 429 {
-                // Once the rate limit clears, ease back into polling instead of resuming the
-                // aggressive overdue cadence, which tends to immediately re-trigger the 429.
-                session.recoveryInterval = Self.recoveryStartInterval
-            }
-
             session.retryCount += 1
 
             await reschedule(
                 app: app,
                 session: &session,
-                pollInterval: nextPollInterval,
+                pollInterval: min(session.pollInterval * Self.errorBackoff, Self.maxInterval),
                 lastReading: session.lastReading,
                 readings: session.readings,
-                delay: delay,
+                delay: Self.jittered(session.pollInterval),
                 sessionCapture: sessionCapture,
                 resetRetries: false
             )
         }
+    }
+
+    /// Reschedules a session that hit a Dexcom rate limit (HTTP 429). Queues the next
+    /// poll for a reading boundary at least `rateLimitMinDelay` out — or the response's
+    /// `Retry-After` delay when Dexcom asks for a longer wait — skipping any reading
+    /// about to land, since retrying right before it just re-triggers the 429.
+    private func rescheduleAfterRateLimit(
+        app: Application,
+        session: inout LiveActivityPollSession,
+        httpResponse: DexcomHTTPResponse?,
+        sessionCapture: SessionCapture
+    ) async {
+        let retryAfter = Self.honoredRetryAfter(httpResponse)
+        let delay = Self.delayUntilNextReading(
+            after: session.lastReadingDate,
+            now: Date(),
+            minimumDelay: max(Self.rateLimitMinDelay, retryAfter)
+        )
+
+        // Once the rate limit clears, ease back into polling instead of resuming the
+        // aggressive overdue cadence, which tends to immediately re-trigger the 429.
+        // A Retry-After longer than the usual recovery start means the limit window is
+        // wide — keep the floor at least that wide too.
+        session.recoveryInterval = max(Self.recoveryStartInterval, retryAfter)
+        session.retryCount += 1
+
+        await reschedule(
+            app: app,
+            session: &session,
+            pollInterval: min(session.pollInterval * Self.errorBackoff, Self.maxInterval),
+            lastReading: session.lastReading,
+            readings: session.readings,
+            delay: delay,
+            sessionCapture: sessionCapture,
+            resetRetries: false
+        )
+    }
+
+    /// The `Retry-After` delay to honor from a rate-limited response, capped at
+    /// `maxRetryAfter`. Returns 0 when the response carried no usable header, so
+    /// callers can take `max` with their own floors.
+    static func honoredRetryAfter(_ httpResponse: DexcomHTTPResponse?) -> TimeInterval {
+        min(httpResponse?.retryAfter ?? 0, maxRetryAfter)
     }
 
     private func handleGenericError(
