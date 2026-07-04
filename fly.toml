@@ -3,19 +3,10 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 # Topology: the `app` process serves HTTP only (its shard is nil, scheduler disabled);
-# each `worker<i>` process polls shard i of SHARD_COUNT. Run exactly one machine per
-# worker group and allocate a dedicated static egress IP to each:
-#
-#   fly scale count app=1 worker0=1 worker1=1 worker2=1 -a luka-vapor-v2 -y
-#   fly machines egress-ip allocate <worker-machine-id> -a luka-vapor-v2   # per worker
-#   fly machines egress-ip list -a luka-vapor-v2                           # verify
-#
-# Egress IPs persist across `fly deploy` but are RELEASED when a machine is destroyed —
-# re-check `egress-ip list` after any scale-down/up or machine recreation.
-#
-# To change the shard count: add/remove worker groups here, update SHARD_COUNT to match,
-# deploy, scale the new group to 1, allocate its egress IP. Removing both worker groups
-# and SHARD_COUNT entirely restores legacy single-process mode (app runs the scheduler).
+# each `worker<i>` process polls shard i of SHARD_COUNT from its own dedicated static
+# egress IP. SHARD_COUNT must equal the number of worker groups, with one machine per
+# group. See docs/scaling.md for the full runbook: scaling up/down, egress IP commands,
+# safety rules, rollback to single-process mode, and verification.
 
 app = 'luka-vapor-v2'
 primary_region = 'sjc'
