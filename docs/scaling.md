@@ -80,6 +80,25 @@ Sessions previously owned by the removed shard are re-owned by the remaining wor
 their next due tick (rehash) — no manual migration, worst case a few minutes of delayed
 polls during the deploy.
 
+## Deploys triggered from GitHub merges
+
+Merge-triggered `fly deploy` handles almost everything: process groups and `SHARD_COUNT`
+come from the repo's `fly.toml`, new worker groups get one machine each created
+automatically, and existing machines are updated **in place** — which preserves their
+static egress IPs. Ordinary merges therefore need no manual follow-up.
+
+The exception is **egress IP allocation, which no deploy can do** — it's tied to machine
+IDs that only exist after the deploy creates the machine. After the first deploy that
+introduces sharding, and after any deploy that adds a worker group, run the allocate
+commands from "Scale up" above. Until then the new worker polls from Fly's *shared*
+egress pool (the worst IP reputation), so don't leave it long. Likewise, if Fly ever
+recreates a machine (host migration, scale down/up), its egress IP is released — a
+periodic `fly machines egress-ip list` check, or an Axiom alert on a `boot` event whose
+`egress_ip` changed, catches this.
+
+When a merge *removes* a worker group, verify the machine is actually gone
+(`fly machines list`) and scale it to zero if it lingers.
+
 ## Rules that keep this safe
 
 - **Exactly one machine per worker group.** `fly scale count worker1=2` would put two
