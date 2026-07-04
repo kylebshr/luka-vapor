@@ -12,9 +12,22 @@ func routes(_ app: Application) throws {
 
     // Unauthenticated status: how many sessions are being polled, how many Live
     // Activities (one per device token) are currently running, and how many sessions
-    // are currently backing off from a Dexcom rate limit.
-    app.get("activity-count") { req async throws -> LiveActivityPollKeys.ActivityCounts in
-        try await LiveActivityPollKeys.countActivities(on: req.redis)
+    // are currently backing off from a Dexcom rate limit. Browsers (Accept: text/html)
+    // get a small dashboard; everything else keeps the original JSON shape.
+    app.get("activity-count") { req async throws -> Response in
+        let counts = try await LiveActivityPollKeys.countActivities(on: req.redis)
+
+        // Exact type/subType match: HTTPMediaType's == does wildcard matching, which
+        // would count curl's default `Accept: */*` as HTML and break JSON consumers.
+        if req.headers.accept.contains(where: { $0.mediaType.type == "text" && $0.mediaType.subType == "html" }) {
+            var headers = HTTPHeaders()
+            headers.contentType = HTTPMediaType(type: "text", subType: "html", parameters: ["charset": "utf-8"])
+            return Response(status: .ok, headers: headers, body: .init(string: StatusDashboard.html(for: counts)))
+        }
+
+        let response = Response(status: .ok)
+        try response.content.encode(counts)
+        return response
     }
 
     app.get("glucose-readings") { req async throws -> Response in

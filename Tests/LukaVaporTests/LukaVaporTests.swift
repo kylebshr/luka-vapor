@@ -71,6 +71,18 @@ struct LukaVaporTests {
         #expect(LiveActivityScheduler.honoredRetryAfter(nil) == 0)
     }
 
+    @Test("Status dashboard renders each count")
+    func statusDashboardHTML() {
+        let counts = LiveActivityPollKeys.ActivityCounts(sessions: 12, activities: 34, rateLimited: 5)
+        let html = StatusDashboard.html(for: counts)
+
+        #expect(html.contains("<!doctype html>"))
+        for (label, value) in [("Sessions", "12"), ("Live Activities", "34"), ("Rate limited", "5")] {
+            #expect(html.contains(label))
+            #expect(html.contains(">\(value)<"))
+        }
+    }
+
     @Test("Recovery floor decays toward minInterval then clears")
     func recoveryDecay() {
         // Starts at recoveryStartInterval (300) and shrinks by 0.6 each healthy poll.
