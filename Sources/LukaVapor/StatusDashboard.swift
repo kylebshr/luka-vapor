@@ -27,6 +27,8 @@ enum StatusDashboard {
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta http-equiv="refresh" content="30">
+        <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fafafa">
+        <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#131316">
         <title>Luka status</title>
         <style>
           :root {
@@ -51,19 +53,23 @@ enum StatusDashboard {
           * { box-sizing: border-box; margin: 0; }
           body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            -webkit-text-size-adjust: 100%;
             background: var(--surface);
             color: var(--ink);
             display: grid;
             place-items: center;
             min-height: 100vh;
-            padding: 24px;
+            min-height: 100svh;
+            padding: 20px;
           }
           main { width: 100%; max-width: 640px; }
           h1 { font-size: 1.25rem; font-weight: 600; }
           .subtitle { color: var(--ink-secondary); font-size: 0.875rem; margin-top: 4px; }
+          /* 220px minimum forces a single column on phone widths (the primary viewer)
+             while still tiling side-by-side on anything wider. */
           .tiles {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 12px;
             margin-top: 20px;
           }
