@@ -2,11 +2,22 @@
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
+# Topology: the `app` process serves HTTP only (its shard is nil, scheduler disabled);
+# each `worker<i>` process polls shard i of SHARD_COUNT from its own dedicated static
+# egress IP. SHARD_COUNT must equal the number of worker groups, with one machine per
+# group. See docs/scaling.md for the full runbook: scaling up/down, egress IP commands,
+# safety rules, rollback to single-process mode, and verification.
 
 app = 'luka-vapor-v2'
 primary_region = 'sjc'
 
 [build]
+
+[processes]
+  app = 'serve --env production --hostname 0.0.0.0 --port 8080'
+  worker0 = 'serve --env production --hostname 0.0.0.0 --port 8080'
+  worker1 = 'serve --env production --hostname 0.0.0.0 --port 8080'
+  worker2 = 'serve --env production --hostname 0.0.0.0 --port 8080'
 
 [http_service]
   internal_port = 8080
@@ -18,6 +29,7 @@ primary_region = 'sjc'
 
 [env]
   LOG_LEVEL = 'info'
+  SHARD_COUNT = '3'
 
 [[vm]]
   memory = '256mb'

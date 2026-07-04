@@ -9,6 +9,28 @@ import APNS
 import APNSCore
 import VaporAPNS
 
+/// Throttles the idle scheduler_tick heartbeat to once a minute. A reference type so the
+/// single scheduled job instance shares state across ticks.
+private final class IdleHeartbeat: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastEmit = Date.distantPast
+    static let interval: TimeInterval = 60
+
+    func shouldEmit(now: Date) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now.timeIntervalSince(lastEmit) >= Self.interval else { return false }
+        lastEmit = now
+        return true
+    }
+
+    func markEmitted(now: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        lastEmit = now
+    }
+}
+
 // Captures session IDs when DexcomClient logs in
 private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
     var accountID: UUID?
@@ -49,19 +71,51 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // On a 429, never reschedule sooner than this. A reading about to land would just get
     // rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
     static let rateLimitMinDelay: TimeInterval = 60 * 4 // 4 min
+    // Small random spread added to error/overdue reschedules. A cohort synchronized by a
+    // shared event (a Dexcom outage erroring many sessions in one tick) computes its next
+    // delay from a shared "now" and would otherwise re-poll in lockstep until fresh
+    // readings re-anchor each member.
+    static let rescheduleJitterMax: TimeInterval = 15
+
+    /// The slice of the poll schedule this process owns. Members outside the shard are
+    /// left for their owning worker, so each Dexcom account is only ever polled from one
+    /// machine — one stable egress IP.
+    let shard: ShardConfig
+    private let idleHeartbeat = IdleHeartbeat()
+
+    init(shard: ShardConfig) {
+        self.shard = shard
+    }
 
     func run(context: QueueContext) async throws {
         let app = context.application
         let now = Date()
         let nowTimestamp = now.timeIntervalSince1970
 
-        let dueSessions = try await getDueSessions(app: app, beforeTimestamp: nowTimestamp)
+        let (claimed, dueCount) = try await getDueSessions(app: app, beforeTimestamp: nowTimestamp)
 
-        guard !dueSessions.isEmpty else { return }
+        if dueCount > 0 {
+            idleHeartbeat.markEmitted(now: now)
+            app.axiom?.emit("scheduler_tick", attributes: [
+                "due_count": String(dueCount),
+                "claimed_count": String(claimed.count),
+            ])
+        } else {
+            // Periodic idle beat so a dead or stalled shard shows up in Axiom as a
+            // missing heartbeat rather than silence indistinguishable from "no work".
+            if idleHeartbeat.shouldEmit(now: now) {
+                app.axiom?.emit("scheduler_tick", attributes: [
+                    "due_count": "0", "claimed_count": "0",
+                ])
+            }
+            return
+        }
 
-        context.logger.info("📥 Dequeued sessions (\(dueSessions.count))")
+        guard !claimed.isEmpty else { return }
 
-        for username in dueSessions {
+        context.logger.info("📥 Dequeued sessions (\(claimed.count))")
+
+        for username in claimed {
             await processSession(username: username, app: app, now: now)
             try? await Task.sleep(for: .milliseconds(300))
         }
@@ -69,26 +123,37 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     // MARK: - Redis Operations
 
-    /// Queries for sessions due for processing and immediately bumps their scores
-    /// to prevent re-pickup by subsequent scheduler runs.
-    private func getDueSessions(app: Application, beforeTimestamp: Double) async throws -> [String] {
+    /// Queries for due sessions in this shard and atomically claims them.
+    ///
+    /// Claiming rewrites a member's score only if it is still due (single Lua script), so
+    /// concurrent scanners — sharded workers during deploy skew, an accidental double
+    /// scale — can never both pick up the same session and double-spend its account's
+    /// Dexcom read budget.
+    private func getDueSessions(
+        app: Application,
+        beforeTimestamp: Double
+    ) async throws -> (claimed: [String], dueCount: Int) {
         let results = try await app.redis.zrangebyscore(
             from: LiveActivityPollKeys.scheduleKey,
             withScoresBetween: (.inclusive(-.infinity), .inclusive(beforeTimestamp))
         ).get()
 
-        let usernames = results.compactMap { String(fromRESP: $0) }
+        let due = results.compactMap { String(fromRESP: $0) }.filter(shard.owns)
+        guard !due.isEmpty else { return ([], 0) }
 
-        // Bump scores to prevent re-pickup while processing.
-        let processingTimestamp = beforeTimestamp + Self.maxInterval
-        for username in usernames {
-            _ = try? await app.redis.zadd(
-                (element: username, score: processingTimestamp),
-                to: LiveActivityPollKeys.scheduleKey
-            ).get()
-        }
+        let claimed = try await LiveActivityPollKeys.claimDueSessions(
+            due.map { ($0, beforeTimestamp + Self.maxInterval) },
+            dueBefore: beforeTimestamp,
+            on: app.redis
+        )
 
-        return usernames
+        return (claimed, due.count)
+    }
+
+    /// Adds a small random delay so cohorts of sessions rescheduled from the same tick
+    /// drift apart instead of staying synchronized.
+    static func jittered(_ delay: TimeInterval) -> TimeInterval {
+        delay + .random(in: 0...rescheduleJitterMax)
     }
 
     private func removeSession(app: Application, username: String) async {
@@ -122,42 +187,13 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            // Poll Dexcom up front so the push-to-start seed below — and the client-facing
-            // cached /glucose-readings endpoint, which both read session.readings — reflect
-            // the freshest reading rather than the previous tick's cache. Previously the poll
-            // ran only after expiry handling (and not at all when the session was torn down),
-            // so an hour-7 restart seeded a stale value. The result is reused by
-            // pollAndUpdate, so the common path makes no extra Dexcom call; only a session
-            // that fully expires this tick incurs one poll it would otherwise have skipped.
-            let sessionCapture = SessionCapture()
-            let client = DexcomClient(
-                username: session.username,
-                password: session.password,
-                existingAccountID: session.accountID,
-                existingSessionID: session.sessionID,
-                accountLocation: session.accountLocation
-            )
-            await client.setDelegate(sessionCapture)
-
-            let pollResult: Result<[GlucoseReading], any Error>
-            do {
-                app.logger.info("🔄 \(session.logID) Checking for new readings")
-                let readings = try await client.getGlucoseReadings(
-                    duration: .init(value: 24, unit: .hours)
-                ).sorted { $0.date < $1.date }
-                pollResult = .success(readings)
-            } catch {
-                pollResult = .failure(error)
-            }
-
-            // Seed restarts from the fresh poll; fall back to the cache if it failed or was
-            // empty so a poll blip never seeds an emptier activity than before.
-            let polledReadings = try? pollResult.get()
-            let hasFreshReadings = !(polledReadings?.isEmpty ?? true)
-            let seedReadings = hasFreshReadings
-                ? polledReadings!
-                : (session.readings ?? session.lastReading.map { [$0] } ?? [])
-            let seedLatestReading = hasFreshReadings ? polledReadings!.last : session.lastReading
+            // Seed push-to-start restarts from the cached readings (≤ ~5 min old) — the
+            // same seed the debug restart route uses. Expiry runs BEFORE the Dexcom poll so
+            // a session whose tokens all expired this tick tears down without spending a
+            // Dexcom read; the restarted activity receives a fresh poll's push within
+            // seconds of re-registering, so the slightly stale seed is momentary.
+            let seedReadings = session.readings ?? session.lastReading.map { [$0] } ?? []
+            let seedLatestReading = session.lastReading
 
             // 1. Per-token expiry: remove tokens past their max duration, send end to each.
             var expiredTokens: [LiveActivityTokenEntry] = []
@@ -211,13 +247,59 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             if session.tokens.isEmpty {
                 app.logger.info("🛑 \(session.logID) All tokens expired, removing session")
-                // Only tears down if no token field remains — a device that registered during
-                // the poll keeps the session alive for the next tick.
+                // Only tears down if no token field remains — a device that registered
+                // during this tick keeps the session alive for the next one. No Dexcom
+                // call was spent on this fully-expired session.
                 _ = try? await LiveActivityPollKeys.pruneSession(for: username, on: app.redis)
                 return
             }
 
-            // 2. Process the poll performed above
+            // 2. Poll Dexcom.
+            let sessionCapture = SessionCapture()
+            let client = DexcomClient(
+                username: session.username,
+                password: session.password,
+                existingAccountID: session.accountID,
+                existingSessionID: session.sessionID,
+                accountLocation: session.accountLocation
+            )
+            await client.setDelegate(sessionCapture)
+
+            let pollStart = Date()
+            let pollResult: Result<[GlucoseReading], any Error>
+            do {
+                app.logger.info("🔄 \(session.logID) Checking for new readings")
+                let readings = try await client.getGlucoseReadings(
+                    duration: .init(value: 24, unit: .hours)
+                ).sorted { $0.date < $1.date }
+                pollResult = .success(readings)
+            } catch {
+                pollResult = .failure(error)
+            }
+
+            // One event per Dexcom request — the denominator that turns 429 counts into a
+            // rate. Polls are serialized ~300ms apart per machine, so consecutive 429s
+            // spanning different users implicate the egress IP; isolated per-user 429s
+            // bracketed by other users' successes implicate the account.
+            let pollMeta: (outcome: String, status: String, endpoint: String) = switch pollResult {
+            case .success(let readings):
+                (readings.isEmpty ? "empty" : "success", "200", "readings")
+            case .failure(let error as DexcomDecodingError):
+                ("error", error.statusCode?.description ?? "unknown", error.url?.lastPathComponent ?? "unknown")
+            case .failure:
+                ("error", "unknown", "unknown")
+            }
+            app.axiom?.emit("poll", attributes: [
+                "user": session.logID,
+                "outcome": pollMeta.outcome,
+                "status_code": pollMeta.status,
+                "endpoint": pollMeta.endpoint,
+                "latency_ms": String(Int(Date().timeIntervalSince(pollStart) * 1000)),
+                "poll_interval": String(Int(session.pollInterval)),
+                "recovery_active": session.recoveryInterval != nil ? "true" : "false",
+            ])
+
+            // 3. Process the poll
             await pollAndUpdate(
                 app: app,
                 session: &session,
@@ -282,7 +364,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                         pollInterval: nextPollInterval,
                         lastReading: session.lastReading,
                         readings: session.readings,
-                        delay: max(session.pollInterval, Self.pollFloor(for: session)),
+                        delay: Self.jittered(max(session.pollInterval, Self.pollFloor(for: session))),
                         sessionCapture: sessionCapture,
                         resetRetries: false
                     )
@@ -336,6 +418,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "error": error.errorDescription,
                 "retry_count": String(session.retryCount),
                 "will_end": (session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit) ? "true" : "false",
+                // On a 429, a Cloudflare HTML error page here means edge/per-IP rate
+                // limiting; a Dexcom JSON FaultException means app-level limiting.
+                "body_prefix": String((String(data: error.body, encoding: .utf8) ?? "<non-utf8>").prefix(200)),
             ])
             await handleDecodingError(app: app, session: &session, error: error, sessionCapture: sessionCapture)
             let staleReason = error.statusCode == 429 ? "Rate limited" : "Dexcom error"
@@ -428,7 +513,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     minimumDelay: Self.rateLimitMinDelay
                 )
             } else {
-                session.pollInterval
+                Self.jittered(session.pollInterval)
             }
 
             if error.statusCode == 429 {
@@ -474,7 +559,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 pollInterval: nextPollInterval,
                 lastReading: session.lastReading,
                 readings: session.readings,
-                delay: session.pollInterval,
+                delay: Self.jittered(session.pollInterval),
                 sessionCapture: sessionCapture,
                 resetRetries: false
             )

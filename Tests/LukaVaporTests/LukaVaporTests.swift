@@ -4,16 +4,6 @@ import Testing
 
 @Suite("App Tests")
 struct LukaVaporTests {
-    @Test("Test Hello World Route")
-    func helloWorld() async throws {
-        try await withApp(configure: configure) { app in
-            try await app.testing().test(.GET, "hello", afterResponse: { res async in
-                #expect(res.status == .ok)
-                #expect(res.body.string == "Hello, world!")
-            })
-        }
-    }
-
     @Test("Rate limit reschedules to the next reading, skipping the missed cycle")
     func rateLimitSkipsToNextReading() {
         let floor = LiveActivityScheduler.rateLimitMinDelay
@@ -53,5 +43,66 @@ struct LukaVaporTests {
         // Next step drops to/below minInterval, so recovery clears entirely.
         #expect(LiveActivityScheduler.decayedRecovery(floor) == nil) // 38.88 -> nil
         #expect(LiveActivityScheduler.decayedRecovery(nil) == nil)
+    }
+}
+
+@Suite("Sharding Tests")
+struct ShardingTests {
+    // Hardcoded FNV-1a 64 values: the hash is a persistence contract — usernames in the
+    // Redis schedule set are routed by it, so a refactor that changes these values would
+    // silently remap live users across shards (and egress IPs).
+    @Test("FNV-1a hash is stable across releases")
+    func hashStability() {
+        #expect(ShardHash.hash("") == 0xcbf29ce484222325)
+        #expect(ShardHash.hash("a") == 0xaf63dc4c8601ec8c)
+        #expect(ShardHash.hash("kyle@example.com") == 0x9486e4cd016ae06f)
+        #expect(ShardHash.hash("user@test.com") == 0xc3ecaf6e4f41ceed)
+    }
+
+    @Test("Every username is owned by exactly one shard, roughly evenly")
+    func partition() {
+        let count = 3
+        let shards = (0..<count).map { ShardConfig(index: $0, count: count) }
+        var perShard = [Int](repeating: 0, count: count)
+
+        for i in 0..<1000 {
+            let username = "user\(i)@example.com"
+            let owners = shards.filter { $0.owns(username) }
+            #expect(owners.count == 1)
+            perShard[ShardHash.shard(for: username, count: count)] += 1
+        }
+
+        // Rough balance: each shard within ~20% of an even split.
+        for shardCount in perShard {
+            #expect(shardCount > 266)
+            #expect(shardCount < 400)
+        }
+    }
+
+    @Test("Shard config detection")
+    func detect() {
+        let logger = Logger(label: "test")
+        func config(_ env: [String: String]) -> ShardConfig? {
+            ShardConfig.detect(env: { env[$0] }, logger: logger)
+        }
+
+        // No env: legacy single-process mode.
+        #expect(config([:]) == ShardConfig(index: 0, count: 1))
+
+        // Fly worker process groups take their index from the group name.
+        #expect(config(["SHARD_COUNT": "3", "FLY_PROCESS_GROUP": "worker0"]) == ShardConfig(index: 0, count: 3))
+        #expect(config(["SHARD_COUNT": "3", "FLY_PROCESS_GROUP": "worker2"]) == ShardConfig(index: 2, count: 3))
+
+        // The HTTP-only app process never runs the scheduler.
+        #expect(config(["SHARD_COUNT": "3", "FLY_PROCESS_GROUP": "app"]) == nil)
+        #expect(config(["SHARD_COUNT": "3"]) == nil)
+
+        // A worker outside the count is a misconfiguration: refuse to poll.
+        #expect(config(["SHARD_COUNT": "3", "FLY_PROCESS_GROUP": "worker5"]) == nil)
+        #expect(config(["SHARD_COUNT": "0", "FLY_PROCESS_GROUP": "worker0"]) == nil)
+
+        // Explicit override for local multi-process testing.
+        #expect(config(["SHARD_INDEX": "1", "SHARD_COUNT": "2"]) == ShardConfig(index: 1, count: 2))
+        #expect(config(["SHARD_INDEX": "2", "SHARD_COUNT": "2"]) == nil)
     }
 }

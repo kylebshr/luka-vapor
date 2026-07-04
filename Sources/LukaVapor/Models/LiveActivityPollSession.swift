@@ -251,6 +251,47 @@ enum LiveActivityPollKeys {
         }
     }
 
+    /// Atomically claims due schedule members. For each (username, newScore) pair, the
+    /// member is claimed — its score rewritten to `newScore` — only if its score is still
+    /// ≤ `dueBefore`. Returns the usernames actually claimed.
+    ///
+    /// The ZSCORE check and ZADD run in one script, so with multiple scanners (sharded
+    /// workers, deploy-skew overlap) exactly one process wins each due member. The previous
+    /// fetch-then-bump was a read-modify-write race that would double-poll a session —
+    /// double-spending that account's Dexcom read budget.
+    static func claimDueSessions(
+        _ entries: [(username: String, newScore: Double)],
+        dueBefore: Double,
+        on client: any RedisClient
+    ) async throws -> [String] {
+        guard !entries.isEmpty else { return [] }
+        let script = """
+        local claimed = {}
+        local i = 2
+        while i < #ARGV do
+            local score = redis.call('ZSCORE', KEYS[1], ARGV[i])
+            if score and tonumber(score) <= tonumber(ARGV[1]) then
+                redis.call('ZADD', KEYS[1], ARGV[i + 1], ARGV[i])
+                claimed[#claimed + 1] = ARGV[i]
+            end
+            i = i + 2
+        end
+        return claimed
+        """
+        var args: [RESPValue] = [
+            RESPValue(from: script),
+            RESPValue(from: "1"),
+            RESPValue(from: scheduleKey.rawValue),
+            RESPValue(from: String(dueBefore)),
+        ]
+        for entry in entries {
+            args.append(RESPValue(from: entry.username))
+            args.append(RESPValue(from: String(entry.newScore)))
+        }
+        let result = try await client.send(command: "EVAL", with: args).get()
+        return (result.array ?? []).compactMap(\.string)
+    }
+
     /// A count of currently-tracked sessions and the running Live Activities across them.
     struct ActivityCounts: Codable, Sendable {
         /// One per Dexcom username being polled.
