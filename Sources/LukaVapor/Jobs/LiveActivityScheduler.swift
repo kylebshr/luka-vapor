@@ -71,15 +71,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // On a 429, never reschedule sooner than this. A reading about to land would just get
     // rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
     static let rateLimitMinDelay: TimeInterval = 60 * 4 // 4 min
-    // After a restart, every session due during the outage lands in a single tick. Claim at
-    // most this many per tick and spread the rest across burstSpreadWindow — processing the
-    // whole backlog back-to-back is a sustained max-rate burst from this machine's IP,
-    // exactly the traffic shape that draws 429s.
-    static let burstThreshold = 10
-    static let burstSpreadWindow: TimeInterval = 180
     // Small random spread added to error/overdue reschedules. A cohort synchronized by a
-    // shared burst (deploy, Dexcom outage) computes its next delay from a shared "now" and
-    // would otherwise re-poll in lockstep until fresh readings re-anchor each member.
+    // shared event (a Dexcom outage erroring many sessions in one tick) computes its next
+    // delay from a shared "now" and would otherwise re-poll in lockstep until fresh
+    // readings re-anchor each member.
     static let rescheduleJitterMax: TimeInterval = 15
 
     /// The slice of the poll schedule this process owns. Members outside the shard are
@@ -97,21 +92,20 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let now = Date()
         let nowTimestamp = now.timeIntervalSince1970
 
-        let (claimed, dueCount, deferredCount) = try await getDueSessions(app: app, beforeTimestamp: nowTimestamp)
+        let (claimed, dueCount) = try await getDueSessions(app: app, beforeTimestamp: nowTimestamp)
 
         if dueCount > 0 {
             idleHeartbeat.markEmitted(now: now)
             app.axiom?.emit("scheduler_tick", attributes: [
                 "due_count": String(dueCount),
                 "claimed_count": String(claimed.count),
-                "deferred_count": String(deferredCount),
             ])
         } else {
             // Periodic idle beat so a dead or stalled shard shows up in Axiom as a
             // missing heartbeat rather than silence indistinguishable from "no work".
             if idleHeartbeat.shouldEmit(now: now) {
                 app.axiom?.emit("scheduler_tick", attributes: [
-                    "due_count": "0", "claimed_count": "0", "deferred_count": "0",
+                    "due_count": "0", "claimed_count": "0",
                 ])
             }
             return
@@ -119,7 +113,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
         guard !claimed.isEmpty else { return }
 
-        context.logger.info("📥 Dequeued sessions (\(claimed.count)\(deferredCount > 0 ? ", deferred \(deferredCount)" : ""))")
+        context.logger.info("📥 Dequeued sessions (\(claimed.count))")
 
         for username in claimed {
             await processSession(username: username, app: app, now: now)
@@ -129,8 +123,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
     // MARK: - Redis Operations
 
-    /// Queries for due sessions in this shard and atomically claims a bounded batch,
-    /// deferring any backlog beyond it across `burstSpreadWindow`.
+    /// Queries for due sessions in this shard and atomically claims them.
     ///
     /// Claiming rewrites a member's score only if it is still due (single Lua script), so
     /// concurrent scanners — sharded workers during deploy skew, an accidental double
@@ -139,39 +132,22 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     private func getDueSessions(
         app: Application,
         beforeTimestamp: Double
-    ) async throws -> (claimed: [String], dueCount: Int, deferredCount: Int) {
+    ) async throws -> (claimed: [String], dueCount: Int) {
         let results = try await app.redis.zrangebyscore(
             from: LiveActivityPollKeys.scheduleKey,
             withScoresBetween: (.inclusive(-.infinity), .inclusive(beforeTimestamp))
         ).get()
 
         let due = results.compactMap { String(fromRESP: $0) }.filter(shard.owns)
-        guard !due.isEmpty else { return ([], 0, 0) }
+        guard !due.isEmpty else { return ([], 0) }
 
-        let batch = due.prefix(Self.burstThreshold).map { ($0, beforeTimestamp + Self.maxInterval) }
         let claimed = try await LiveActivityPollKeys.claimDueSessions(
-            batch, dueBefore: beforeTimestamp, on: app.redis
+            due.map { ($0, beforeTimestamp + Self.maxInterval) },
+            dueBefore: beforeTimestamp,
+            on: app.redis
         )
 
-        let overflow = Array(due.dropFirst(Self.burstThreshold))
-        var deferredCount = 0
-        if !overflow.isEmpty {
-            let offsets = Self.spreadOffsets(count: overflow.count, window: Self.burstSpreadWindow)
-            deferredCount = try await LiveActivityPollKeys.claimDueSessions(
-                zip(overflow, offsets).map { ($0, beforeTimestamp + $1) },
-                dueBefore: beforeTimestamp,
-                on: app.redis
-            ).count
-        }
-
-        return (claimed, due.count, deferredCount)
-    }
-
-    /// Evenly spaced offsets across `window` with slight randomness — how a due-session
-    /// backlog is spread out instead of being processed as one sustained burst.
-    static func spreadOffsets(count: Int, window: TimeInterval) -> [TimeInterval] {
-        guard count > 0 else { return [] }
-        return (0..<count).map { Double($0) / Double(count) * window + .random(in: 0...2) }
+        return (claimed, due.count)
     }
 
     /// Adds a small random delay so cohorts of sessions rescheduled from the same tick

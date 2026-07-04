@@ -44,22 +44,6 @@ struct LukaVaporTests {
         #expect(LiveActivityScheduler.decayedRecovery(floor) == nil) // 38.88 -> nil
         #expect(LiveActivityScheduler.decayedRecovery(nil) == nil)
     }
-
-    @Test("Burst backlog offsets spread across the window")
-    func spreadOffsets() {
-        #expect(LiveActivityScheduler.spreadOffsets(count: 0, window: 180).isEmpty)
-
-        let offsets = LiveActivityScheduler.spreadOffsets(count: 90, window: 180)
-        #expect(offsets.count == 90)
-        // Each offset is its even-spacing slot plus up to 2s of jitter.
-        for (index, offset) in offsets.enumerated() {
-            let slot = Double(index) / 90 * 180
-            #expect(offset >= slot)
-            #expect(offset <= slot + 2)
-        }
-        // The backlog actually spans most of the window rather than clumping.
-        #expect(offsets.last! > 150)
-    }
 }
 
 @Suite("Sharding Tests")
