@@ -83,12 +83,18 @@ struct LukaVaporTests {
         }
     }
 
-    /// Calls overdueReschedule for a last reading `offset` seconds in the past.
-    private func overdue(after offset: TimeInterval, recovery: TimeInterval? = nil) -> (delay: TimeInterval, pollInterval: TimeInterval) {
+    /// Calls overdueReschedule for a last reading `offset` seconds in the past. The
+    /// default `previous` spacing matches a boundary poll scheduled by the healthy path.
+    private func overdue(
+        after offset: TimeInterval,
+        previous: TimeInterval = LiveActivityScheduler.minInterval,
+        recovery: TimeInterval? = nil
+    ) -> (delay: TimeInterval, pollInterval: TimeInterval) {
         let lastReading = Date()
         return LiveActivityScheduler.overdueReschedule(
             lastReadingDate: lastReading,
             now: lastReading.addingTimeInterval(offset),
+            previousPollInterval: previous,
             recoveryInterval: recovery
         )
     }
@@ -103,13 +109,18 @@ struct LukaVaporTests {
         #expect(firstRecheck.delay == LiveActivityScheduler.overdueFirstRetryInterval)
         #expect(firstRecheck.pollInterval == LiveActivityScheduler.overdueFirstRetryInterval)
 
-        // After the first recheck also misses, the standard catch-up cadence applies.
-        let secondRecheck = overdue(after: LiveActivityScheduler.readingInterval + 40)
+        // A poll scheduled by a catch-up recheck: the standard cadence from here on.
+        let secondRecheck = overdue(
+            after: LiveActivityScheduler.readingInterval + LiveActivityScheduler.readingPropagationBuffer
+                + LiveActivityScheduler.overdueFirstRetryInterval,
+            previous: LiveActivityScheduler.overdueFirstRetryInterval
+        )
         #expect(secondRecheck.delay == LiveActivityScheduler.overdueRetryInterval)
 
         // Still inside the window a hair before it closes: same standard cadence.
         let lateInWindow = overdue(
-            after: LiveActivityScheduler.readingInterval + LiveActivityScheduler.overdueCatchupWindow - 1
+            after: LiveActivityScheduler.readingInterval + LiveActivityScheduler.overdueCatchupWindow - 1,
+            previous: LiveActivityScheduler.overdueRetryInterval
         )
         #expect(lateInWindow.delay == LiveActivityScheduler.overdueRetryInterval)
     }

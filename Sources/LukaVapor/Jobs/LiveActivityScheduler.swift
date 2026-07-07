@@ -55,11 +55,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // overdueRetryInterval cadence instead — see overdueReschedule.
     static let minInterval: TimeInterval = 60
     static let maxInterval: TimeInterval = 60
-    // Recheck cadences, and how long past the expected arrival they apply, for a
-    // reading that is due but hasn't appeared yet — see overdueReschedule. The first
-    // recheck is quicker than the rest: the boundary poll runs only
-    // readingPropagationBuffer past the expected arrival, so a miss there usually
-    // means the reading is just seconds away.
+    // Recheck cadences for a reading that is due but hasn't appeared (the first recheck
+    // is quicker), and how long past the expected arrival they apply — see overdueReschedule.
     static let overdueFirstRetryInterval: TimeInterval = 20
     static let overdueRetryInterval: TimeInterval = 30
     static let overdueCatchupWindow: TimeInterval = 120
@@ -88,10 +85,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // when the limit clears, but a malformed or far-future value shouldn't park a
     // session past the point where its Live Activity has any data worth resuming.
     static let maxRetryAfter: TimeInterval = 60 * 30 // 30 min
-    // Small random spread added to error/overdue reschedules. A cohort synchronized by a
-    // shared event (a Dexcom outage erroring many sessions in one tick) computes its next
-    // delay from a shared "now" and would otherwise re-poll in lockstep until fresh
-    // readings re-anchor each member.
+    // Small random spread added to error reschedules. A cohort synchronized by a shared
+    // event (a Dexcom outage erroring many sessions in one tick) computes its next delay
+    // from a shared "now" and would otherwise re-poll in lockstep until fresh readings
+    // re-anchor each member. Overdue rechecks don't need it — they're phase-anchored to
+    // each session's own reading time.
     static let rescheduleJitterMax: TimeInterval = 15
 
     /// The slice of the poll schedule this process owns. Members outside the shard are
@@ -671,15 +669,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static func overdueReschedule(
         lastReadingDate: Date,
         now: Date,
+        previousPollInterval: TimeInterval,
         recoveryInterval: TimeInterval?
     ) -> (delay: TimeInterval, pollInterval: TimeInterval) {
         let recoveryFloor = recoveryInterval ?? 0
         let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
         if timeSinceLastReading < readingInterval + overdueCatchupWindow {
-            // Less than one standard retry step past the boundary means this is the
-            // first recheck opportunity after the boundary poll's miss.
-            let overdueBy = timeSinceLastReading - readingInterval
-            let cadence = overdueBy < overdueRetryInterval ? overdueFirstRetryInterval : overdueRetryInterval
+            // Catch-up rechecks are the only polls scheduled with a sub-minute spacing,
+            // so a larger previous spacing means this poll wasn't one — it's the boundary
+            // poll itself, and its miss is the first recheck opportunity. (A recovery
+            // floor can misclassify a recheck as first, but then the floor dominates the
+            // cadence anyway.)
+            let isFirstRecheck = previousPollInterval > overdueRetryInterval
+            let cadence = isFirstRecheck ? overdueFirstRetryInterval : overdueRetryInterval
             let interval = Swift.max(cadence, recoveryFloor)
             return (interval, interval)
         }
@@ -727,9 +729,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
 
         if now.timeIntervalSince(lastDate) >= Self.readingInterval {
+            // No jitter here: rechecks are phase-anchored to each session's own reading
+            // time, so cohorts don't synchronize — same as the boundary and 429 paths.
             let (delay, nextPollInterval) = Self.overdueReschedule(
                 lastReadingDate: lastDate,
                 now: now,
+                previousPollInterval: session.pollInterval,
                 recoveryInterval: session.recoveryInterval
             )
             await reschedule(
@@ -738,7 +743,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 pollInterval: nextPollInterval,
                 lastReading: session.lastReading,
                 readings: session.readings,
-                delay: Self.jittered(delay),
+                delay: delay,
                 sessionCapture: sessionCapture,
                 resetRetries: false
             )
