@@ -83,6 +83,77 @@ struct LukaVaporTests {
         }
     }
 
+    @Test("Overdue readings recheck quickly through the catch-up window")
+    func overdueCatchupWindow() {
+        let lastReading = Date()
+
+        // Just overdue (expected reading hasn't propagated yet): quick recheck cadence.
+        let justOverdue = LiveActivityScheduler.overdueReschedule(
+            lastReadingDate: lastReading,
+            now: lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval + 20),
+            recoveryInterval: nil
+        )
+        #expect(justOverdue.delay == LiveActivityScheduler.overdueRetryInterval)
+        #expect(justOverdue.pollInterval == LiveActivityScheduler.overdueRetryInterval)
+
+        // Still inside the window a hair before it closes: same quick cadence.
+        let lateInWindow = LiveActivityScheduler.overdueReschedule(
+            lastReadingDate: lastReading,
+            now: lastReading.addingTimeInterval(
+                LiveActivityScheduler.readingInterval + LiveActivityScheduler.overdueCatchupWindow - 1
+            ),
+            recoveryInterval: nil
+        )
+        #expect(lateInWindow.delay == LiveActivityScheduler.overdueRetryInterval)
+    }
+
+    @Test("Past the catch-up window, overdue polls anchor to reading boundaries")
+    func overdueSettlesToBoundaries() {
+        let lastReading = Date()
+
+        // 7.5 minutes since the last reading — the window has closed, so aim for the
+        // next reading boundary (10:00 after the last reading) plus the 20s buffer.
+        let pastWindow = LiveActivityScheduler.overdueReschedule(
+            lastReadingDate: lastReading,
+            now: lastReading.addingTimeInterval(450),
+            recoveryInterval: nil
+        )
+        #expect(pastWindow.delay == 150 + 20)
+        #expect(pastWindow.pollInterval == LiveActivityScheduler.readingInterval)
+
+        // Deep in a gap, polling from a boundary+20s poll lands on the next boundary+20s:
+        // one poll per reading cycle, phase-locked to the last reading.
+        let deepGap = LiveActivityScheduler.overdueReschedule(
+            lastReadingDate: lastReading,
+            now: lastReading.addingTimeInterval(10 * LiveActivityScheduler.readingInterval + 20),
+            recoveryInterval: nil
+        )
+        #expect(deepGap.delay == LiveActivityScheduler.readingInterval)
+        #expect(deepGap.pollInterval == LiveActivityScheduler.readingInterval)
+    }
+
+    @Test("Post-429 recovery floor overrides the quick overdue cadence")
+    func overdueRespectsRecoveryFloor() {
+        let lastReading = Date()
+
+        // Inside the catch-up window but recovering from a rate limit: the recovery
+        // floor wins over the quick cadence.
+        let recovering = LiveActivityScheduler.overdueReschedule(
+            lastReadingDate: lastReading,
+            now: lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval + 20),
+            recoveryInterval: LiveActivityScheduler.recoveryStartInterval
+        )
+        #expect(recovering.delay == LiveActivityScheduler.recoveryStartInterval)
+
+        // Past the window, a boundary sooner than the floor is skipped for the next one.
+        let boundarySkipped = LiveActivityScheduler.overdueReschedule(
+            lastReadingDate: lastReading,
+            now: lastReading.addingTimeInterval(450),
+            recoveryInterval: 240
+        )
+        #expect(boundarySkipped.delay == 450 + 20) // 15:00 boundary, not 10:00
+    }
+
     @Test("Recovery floor decays toward minInterval then clears")
     func recoveryDecay() {
         // Starts at recoveryStartInterval (300) and shrinks by 0.6 each healthy poll.
