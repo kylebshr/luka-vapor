@@ -10,8 +10,8 @@ struct LukaVaporTests {
         let floor = LiveActivityScheduler.rateLimitMinDelay
         let lastReading = Date()
 
-        // Polled 20s after the expected reading (5m + 20s buffer) and got rate limited:
-        // skip the missed reading and aim for the following one, ~5 min out.
+        // Polled 20s after the expected reading and got rate limited: skip the missed
+        // reading and aim for the following one, ~5 min out.
         let overdueNow = lastReading.addingTimeInterval(LiveActivityScheduler.readingInterval + 20)
         let overdueDelay = LiveActivityScheduler.delayUntilNextReading(
             after: lastReading, now: overdueNow, minimumDelay: floor
@@ -95,12 +95,19 @@ struct LukaVaporTests {
 
     @Test("Overdue readings recheck quickly through the catch-up window")
     func overdueCatchupWindow() {
-        // Just overdue (expected reading hasn't propagated yet): quick recheck cadence.
-        let justOverdue = overdue(after: LiveActivityScheduler.readingInterval + 20)
-        #expect(justOverdue.delay == LiveActivityScheduler.overdueRetryInterval)
-        #expect(justOverdue.pollInterval == LiveActivityScheduler.overdueRetryInterval)
+        // The boundary poll just missed (the reading hasn't propagated yet): the first
+        // recheck is extra quick, since the reading is usually seconds away.
+        let firstRecheck = overdue(
+            after: LiveActivityScheduler.readingInterval + LiveActivityScheduler.readingPropagationBuffer
+        )
+        #expect(firstRecheck.delay == LiveActivityScheduler.overdueFirstRetryInterval)
+        #expect(firstRecheck.pollInterval == LiveActivityScheduler.overdueFirstRetryInterval)
 
-        // Still inside the window a hair before it closes: same quick cadence.
+        // After the first recheck also misses, the standard catch-up cadence applies.
+        let secondRecheck = overdue(after: LiveActivityScheduler.readingInterval + 40)
+        #expect(secondRecheck.delay == LiveActivityScheduler.overdueRetryInterval)
+
+        // Still inside the window a hair before it closes: same standard cadence.
         let lateInWindow = overdue(
             after: LiveActivityScheduler.readingInterval + LiveActivityScheduler.overdueCatchupWindow - 1
         )
@@ -110,14 +117,16 @@ struct LukaVaporTests {
     @Test("Past the catch-up window, overdue polls anchor to reading boundaries")
     func overdueSettlesToBoundaries() {
         // 7.5 minutes since the last reading — the window has closed, so aim for the
-        // next reading boundary (10:00 after the last reading) plus the 20s buffer.
+        // next reading boundary (10:00 after the last reading) plus the buffer.
         let pastWindow = overdue(after: 450)
-        #expect(pastWindow.delay == 150 + 20)
+        #expect(pastWindow.delay == 150 + LiveActivityScheduler.readingPropagationBuffer)
         #expect(pastWindow.pollInterval == LiveActivityScheduler.readingInterval)
 
-        // Deep in a gap, polling from a boundary+20s poll lands on the next boundary+20s:
-        // one poll per reading cycle, phase-locked to the last reading.
-        let deepGap = overdue(after: 10 * LiveActivityScheduler.readingInterval + 20)
+        // Deep in a gap, polling from a boundary+buffer poll lands on the next
+        // boundary+buffer: one poll per reading cycle, phase-locked to the last reading.
+        let deepGap = overdue(
+            after: 10 * LiveActivityScheduler.readingInterval + LiveActivityScheduler.readingPropagationBuffer
+        )
         #expect(deepGap.delay == LiveActivityScheduler.readingInterval)
         #expect(deepGap.pollInterval == LiveActivityScheduler.readingInterval)
     }
@@ -134,7 +143,7 @@ struct LukaVaporTests {
 
         // Past the window, a boundary sooner than the floor is skipped for the next one.
         let boundarySkipped = overdue(after: 450, recovery: 240)
-        #expect(boundarySkipped.delay == 450 + 20) // 15:00 boundary, not 10:00
+        #expect(boundarySkipped.delay == 450 + LiveActivityScheduler.readingPropagationBuffer) // 15:00 boundary, not 10:00
     }
 
     @Test("Recovery floor decays toward minInterval then clears")

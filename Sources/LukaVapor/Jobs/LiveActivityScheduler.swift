@@ -55,14 +55,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // overdueRetryInterval cadence instead — see overdueReschedule.
     static let minInterval: TimeInterval = 60
     static let maxInterval: TimeInterval = 60
-    // Quick recheck cadence, and how long past the expected arrival it applies, for a
-    // reading that is due but hasn't appeared yet — see overdueReschedule.
+    // Recheck cadences, and how long past the expected arrival they apply, for a
+    // reading that is due but hasn't appeared yet — see overdueReschedule. The first
+    // recheck is quicker than the rest: the boundary poll runs only
+    // readingPropagationBuffer past the expected arrival, so a miss there usually
+    // means the reading is just seconds away.
+    static let overdueFirstRetryInterval: TimeInterval = 20
     static let overdueRetryInterval: TimeInterval = 30
     static let overdueCatchupWindow: TimeInterval = 120
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     // Extra wait past an expected reading boundary before polling for it, covering
-    // typical Share-side propagation delay.
-    static let readingPropagationBuffer: TimeInterval = 20
+    // typical Share-side propagation delay. Kept small — a miss is cheap now that the
+    // catch-up rechecks are quick, while every cycle pays the buffer in delivery latency.
+    static let readingPropagationBuffer: TimeInterval = 10
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     // Max lifetime of a Live Activity before the server ends it. Supported by all builds.
@@ -654,15 +659,15 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// Scheduling decision for a poll that found the last reading overdue (due but not
     /// yet available). Late readings usually land within a minute or two of the 5-minute
     /// mark (Share-side propagation), so within `overdueCatchupWindow` past the expected
-    /// arrival, recheck on the quick `overdueRetryInterval` cadence instead of backing
-    /// off — per-shard egress IPs give the rate-limit headroom to afford the extra polls,
-    /// and peer Share clients behave the same way (xDrip+ retries in ~10s steps around
-    /// the expected boundary; Nightscout's share2 bridge polls flat every 2.5 min). Past
-    /// the window the reading is genuinely missing (sensor gap, phone offline), so aim
-    /// for each subsequent reading boundary instead — phase-anchored to the last reading,
-    /// so a resumed stream is picked up seconds after it lands rather than minutes. A
-    /// post-429 `recoveryInterval` floors both paths so recovery overrides the quick
-    /// cadence.
+    /// arrival, recheck on a quick cadence instead of backing off — extra quick for the
+    /// first recheck, when the reading is usually just seconds away. Per-shard egress IPs
+    /// give the rate-limit headroom to afford the extra polls, and peer Share clients
+    /// behave the same way (xDrip+ retries in ~10s steps around the expected boundary;
+    /// Nightscout's share2 bridge polls flat every 2.5 min). Past the window the reading
+    /// is genuinely missing (sensor gap, phone offline), so aim for each subsequent
+    /// reading boundary instead — phase-anchored to the last reading, so a resumed stream
+    /// is picked up seconds after it lands rather than minutes. A post-429
+    /// `recoveryInterval` floors both paths so recovery overrides the quick cadence.
     static func overdueReschedule(
         lastReadingDate: Date,
         now: Date,
@@ -671,7 +676,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let recoveryFloor = recoveryInterval ?? 0
         let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
         if timeSinceLastReading < readingInterval + overdueCatchupWindow {
-            let interval = Swift.max(overdueRetryInterval, recoveryFloor)
+            // Less than one standard retry step past the boundary means this is the
+            // first recheck opportunity after the boundary poll's miss.
+            let overdueBy = timeSinceLastReading - readingInterval
+            let cadence = overdueBy < overdueRetryInterval ? overdueFirstRetryInterval : overdueRetryInterval
+            let interval = Swift.max(cadence, recoveryFloor)
             return (interval, interval)
         }
         let delay = delayUntilNextReading(after: lastReadingDate, now: now, minimumDelay: recoveryFloor)
