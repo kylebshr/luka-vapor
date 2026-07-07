@@ -50,11 +50,21 @@ private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
 /// Dexcom is polled once per session, then APNS updates are fanned out to all tokens.
 struct LiveActivityScheduler: AsyncScheduledJob {
     static let appBundleID = "com.kylebashour.Glimpse"
-    // Floor on poll spacing. When a reading is overdue/not yet ready we recheck no more
-    // often than this — a full minute rather than hammering every 30s.
+    // Baseline floor on poll spacing for healthy sessions, and the point below which a
+    // post-429 recovery floor clears. Overdue rechecks use the quicker
+    // overdueRetryInterval cadence instead — see overdueReschedule.
     static let minInterval: TimeInterval = 60
     static let maxInterval: TimeInterval = 60
+    // Recheck cadences for a reading that is due but hasn't appeared (the first recheck
+    // is quicker), and how long past the expected arrival they apply — see overdueReschedule.
+    static let overdueFirstRetryInterval: TimeInterval = 20
+    static let overdueRetryInterval: TimeInterval = 30
+    static let overdueCatchupWindow: TimeInterval = 120
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
+    // Extra wait past an expected reading boundary before polling for it, covering
+    // typical Share-side propagation delay. Kept small — a miss is cheap now that the
+    // catch-up rechecks are quick, while every cycle pays the buffer in delivery latency.
+    static let readingPropagationBuffer: TimeInterval = 10
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     // Max lifetime of a Live Activity before the server ends it. Supported by all builds.
@@ -75,10 +85,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // when the limit clears, but a malformed or far-future value shouldn't park a
     // session past the point where its Live Activity has any data worth resuming.
     static let maxRetryAfter: TimeInterval = 60 * 30 // 30 min
-    // Small random spread added to error/overdue reschedules. A cohort synchronized by a
-    // shared event (a Dexcom outage erroring many sessions in one tick) computes its next
-    // delay from a shared "now" and would otherwise re-poll in lockstep until fresh
-    // readings re-anchor each member.
+    // Small random spread added to error reschedules. A cohort synchronized by a shared
+    // event (a Dexcom outage erroring many sessions in one tick) computes its next delay
+    // from a shared "now" and would otherwise re-poll in lockstep until fresh readings
+    // re-anchor each member. Overdue rechecks don't need it — they're phase-anchored to
+    // each session's own reading time.
     static let rescheduleJitterMax: TimeInterval = 15
 
     /// The slice of the poll schedule this process owns. Members outside the shard are
@@ -336,33 +347,16 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     "retry_count": String(session.retryCount),
                     "minutes_since_last_reading": session.lastReadingDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "unknown",
                 ])
-                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
-                let nextPollInterval = min(session.pollInterval * Self.backoff, Self.overduePollCap(for: session))
-                await reschedule(
-                    app: app,
-                    session: &session,
-                    pollInterval: nextPollInterval,
-                    lastReading: session.lastReading,
-                    readings: session.readings,
-                    delay: max(session.pollInterval, Self.pollFloor(for: session)),
-                    sessionCapture: sessionCapture,
-                    resetRetries: true
-                )
-                return
-            }
-
-            // Check if we have a new reading
-            if let lastDate = session.lastReadingDate, latestReading.date <= lastDate {
-                let timeSinceLastReading = now.timeIntervalSince(lastDate)
-
-                await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
-
-                if timeSinceLastReading >= Self.readingInterval {
-                    // Reading is overdue. Back off toward the reading cadence (~5 min) rather
-                    // than polling every 60s — a new value can't land sooner, so faster polls
-                    // only spend the account's Dexcom read budget and draw 429s. First recheck
-                    // stays quick (delay uses the current, smaller pollInterval) to catch a
-                    // slightly-late reading; sustained gaps settle at overduePollCap.
+                if let lastDate = session.lastReadingDate {
+                    // An empty response with a cached reading is the same state as a
+                    // response containing only already-seen values: the next reading is
+                    // due and hasn't appeared. Handle both identically.
+                    await rescheduleWithoutNewReading(
+                        app: app, session: &session, now: now, lastDate: lastDate, sessionCapture: sessionCapture
+                    )
+                } else {
+                    // Nothing to anchor a reading boundary to (fresh sensor, warmup):
+                    // grow the spacing toward the reading cadence.
                     let nextPollInterval = min(session.pollInterval * Self.backoff, Self.overduePollCap(for: session))
                     await reschedule(
                         app: app,
@@ -370,22 +364,19 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                         pollInterval: nextPollInterval,
                         lastReading: session.lastReading,
                         readings: session.readings,
-                        delay: Self.jittered(max(session.pollInterval, Self.pollFloor(for: session))),
+                        delay: max(session.pollInterval, Self.pollFloor(for: session)),
                         sessionCapture: sessionCapture,
-                        resetRetries: false
-                    )
-                } else {
-                    // Still within normal reading window, wait for next expected reading
-                    await scheduleForNextReading(
-                        app: app,
-                        session: &session,
-                        now: now,
-                        readingDate: lastDate,
-                        reading: session.lastReading,
-                        readings: session.readings,
-                        sessionCapture: sessionCapture
+                        resetRetries: true
                     )
                 }
+                return
+            }
+
+            // Check if we have a new reading
+            if let lastDate = session.lastReadingDate, latestReading.date <= lastDate {
+                await rescheduleWithoutNewReading(
+                    app: app, session: &session, now: now, lastDate: lastDate, sessionCapture: sessionCapture
+                )
                 return
             }
 
@@ -637,32 +628,65 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         return readings.filter { $0.date >= cutoff }
     }
 
-    /// Delay until a reading boundary at least `minimumDelay` out, used to back off from an
-    /// HTTP 429. Readings arrive every `readingInterval`, and a rate limit window usually
-    /// outlasts a short wait — so rather than retrying within the current cycle (which just
-    /// re-triggers the 429), aim for the first reading boundary at least `minimumDelay` away.
-    /// Any reading about to land sooner than that is skipped, since polling right before it
-    /// while rate-limited would only re-trigger the limit.
+    /// Delay until the next reading boundary at least `minimumDelay` out, phase-anchored
+    /// to the last reading — readings arrive every `readingInterval`, plus
+    /// `readingPropagationBuffer` for Share-side propagation. Boundaries closer than
+    /// `minimumDelay` are skipped: the rate-limit path relies on this so a retry never
+    /// lands just before a reading and re-triggers the 429.
     static func delayUntilNextReading(
         after lastReadingDate: Date?,
         now: Date,
         minimumDelay: TimeInterval = 0
     ) -> TimeInterval {
-        let buffer: TimeInterval = 20 // covers typical Share API propagation
         guard let lastReadingDate else {
-            return Swift.max(readingInterval + buffer, minimumDelay)
+            return Swift.max(readingInterval + readingPropagationBuffer, minimumDelay)
         }
         let elapsed = now.timeIntervalSince(lastReadingDate)
         let cyclesElapsed = (elapsed / readingInterval).rounded(.down)
         // Start at the first reading boundary still in the future, then keep skipping
         // boundaries until the wait clears `minimumDelay`.
         var nextReadingDate = lastReadingDate.addingTimeInterval((cyclesElapsed + 1) * readingInterval)
-        var delay = nextReadingDate.timeIntervalSince(now) + buffer
+        var delay = nextReadingDate.timeIntervalSince(now) + readingPropagationBuffer
         while delay < minimumDelay {
             nextReadingDate.addTimeInterval(readingInterval)
-            delay = nextReadingDate.timeIntervalSince(now) + buffer
+            delay = nextReadingDate.timeIntervalSince(now) + readingPropagationBuffer
         }
         return delay
+    }
+
+    /// Scheduling decision for a poll that found the last reading overdue (due but not
+    /// yet available). Late readings usually land within a minute or two of the 5-minute
+    /// mark (Share-side propagation), so within `overdueCatchupWindow` past the expected
+    /// arrival, recheck on a quick cadence instead of backing off — extra quick for the
+    /// first recheck, when the reading is usually just seconds away. Per-shard egress IPs
+    /// give the rate-limit headroom to afford the extra polls, and peer Share clients
+    /// behave the same way (xDrip+ retries in ~10s steps around the expected boundary;
+    /// Nightscout's share2 bridge polls flat every 2.5 min). Past the window the reading
+    /// is genuinely missing (sensor gap, phone offline), so aim for each subsequent
+    /// reading boundary instead — phase-anchored to the last reading, so a resumed stream
+    /// is picked up seconds after it lands rather than minutes. A post-429
+    /// `recoveryInterval` floors both paths so recovery overrides the quick cadence.
+    static func overdueReschedule(
+        lastReadingDate: Date,
+        now: Date,
+        previousPollInterval: TimeInterval,
+        recoveryInterval: TimeInterval?
+    ) -> (delay: TimeInterval, pollInterval: TimeInterval) {
+        let recoveryFloor = recoveryInterval ?? 0
+        let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
+        if timeSinceLastReading < readingInterval + overdueCatchupWindow {
+            // Catch-up rechecks are the only polls scheduled with a sub-minute spacing,
+            // so a larger previous spacing means this poll wasn't one — it's the boundary
+            // poll itself, and its miss is the first recheck opportunity. (A recovery
+            // floor can misclassify a recheck as first, but then the floor dominates the
+            // cadence anyway.)
+            let isFirstRecheck = previousPollInterval > overdueRetryInterval
+            let cadence = isFirstRecheck ? overdueFirstRetryInterval : overdueRetryInterval
+            let interval = Swift.max(cadence, recoveryFloor)
+            return (interval, interval)
+        }
+        let delay = delayUntilNextReading(after: lastReadingDate, now: now, minimumDelay: recoveryFloor)
+        return (delay, readingInterval)
     }
 
     /// Eases the post-rate-limit recovery floor back toward normal polling. Returns the
@@ -679,17 +703,63 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         Swift.max(minInterval, session.recoveryInterval ?? 0)
     }
 
-    /// Upper bound on poll spacing while waiting out a no-reading gap. A new value can't
-    /// arrive faster than the sensor's reading cadence, so once a reading is overdue we let
-    /// the backoff grow toward `readingInterval` (≈5 min) rather than pinning at `maxInterval`
-    /// (60s). Polling every 60s during a gap just burns the account's per-account Dexcom read
-    /// budget on requests that can't return anything new — the dominant source of 429s for
-    /// gap-heavy users. Still respects an active post-429 recovery floor.
+    /// Upper bound on poll spacing while a session has never seen a reading (fresh sensor,
+    /// warmup). With no last reading to anchor a boundary to, the backoff grows toward
+    /// `readingInterval` (≈5 min) rather than pinning at `maxInterval` (60s) — polls faster
+    /// than the sensor's cadence can't return anything new. Sessions with an anchor
+    /// use `rescheduleWithoutNewReading` instead. Still respects an active post-429
+    /// recovery floor.
     private static func overduePollCap(for session: LiveActivityPollSession) -> TimeInterval {
         Swift.max(readingInterval, session.recoveryInterval ?? 0)
     }
 
     // MARK: - Scheduling
+
+    /// Reschedules after a poll that produced nothing newer than the cached reading —
+    /// an empty response or one containing only already-seen values. Sends any due
+    /// stale milestones, then either waits for the next expected reading or rechecks
+    /// on the overdue cadence (see `overdueReschedule`).
+    private func rescheduleWithoutNewReading(
+        app: Application,
+        session: inout LiveActivityPollSession,
+        now: Date,
+        lastDate: Date,
+        sessionCapture: SessionCapture
+    ) async {
+        await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
+
+        if now.timeIntervalSince(lastDate) >= Self.readingInterval {
+            // No jitter here: rechecks are phase-anchored to each session's own reading
+            // time, so cohorts don't synchronize — same as the boundary and 429 paths.
+            let (delay, nextPollInterval) = Self.overdueReschedule(
+                lastReadingDate: lastDate,
+                now: now,
+                previousPollInterval: session.pollInterval,
+                recoveryInterval: session.recoveryInterval
+            )
+            await reschedule(
+                app: app,
+                session: &session,
+                pollInterval: nextPollInterval,
+                lastReading: session.lastReading,
+                readings: session.readings,
+                delay: delay,
+                sessionCapture: sessionCapture,
+                resetRetries: false
+            )
+        } else {
+            // Still within the normal reading window — wait for the next expected reading.
+            await scheduleForNextReading(
+                app: app,
+                session: &session,
+                now: now,
+                readingDate: lastDate,
+                reading: session.lastReading,
+                readings: session.readings,
+                sessionCapture: sessionCapture
+            )
+        }
+    }
 
     private func scheduleForNextReading(
         app: Application,
@@ -700,9 +770,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         readings: [GlucoseReading]?,
         sessionCapture: SessionCapture
     ) async {
-        let timeSinceReading = now.timeIntervalSince(readingDate)
-        let timeUntilNextReading = Self.readingInterval - timeSinceReading
-        let delay = timeUntilNextReading + 20 // give 20s to try to ensure reading is ready (covers typical Share API propagation)
+        let timeUntilNextReading = Self.readingInterval - now.timeIntervalSince(readingDate)
+        let delay = timeUntilNextReading + Self.readingPropagationBuffer
         await reschedule(
             app: app,
             session: &session,
