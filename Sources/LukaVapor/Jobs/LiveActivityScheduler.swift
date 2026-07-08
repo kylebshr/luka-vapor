@@ -62,9 +62,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static let overdueCatchupWindow: TimeInterval = 120
     static let readingInterval: TimeInterval = 60 * 5 // 5 minutes
     // Extra wait past an expected reading boundary before polling for it, covering
-    // typical Share-side propagation delay. Kept small — a miss is cheap now that the
-    // catch-up rechecks are quick, while every cycle pays the buffer in delivery latency.
-    static let readingPropagationBuffer: TimeInterval = 10
+    // typical Share-side propagation delay. At 10s roughly a third of boundary polls
+    // missed, and every miss spent 1–4 catch-up rechecks of the account's Dexcom read
+    // budget — enough extra load to re-trigger per-account 429s. 20s keeps the boundary
+    // poll reliable so the quick rechecks stay the exception.
+    static let readingPropagationBuffer: TimeInterval = 20
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     // Max lifetime of a Live Activity before the server ends it. Supported by all builds.
@@ -76,11 +78,16 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // After a rate limit (429), poll no more often than this at first, then ease back
     // toward minInterval (recoveryInterval shrinks to recoveryDecay of itself on each
     // healthy poll) rather than immediately resuming the aggressive overdue cadence.
+    // Repeated 429s double the floor instead — see escalatedRecovery.
     static let recoveryStartInterval: TimeInterval = 300 // 5 min
     static let recoveryDecay: Double = 0.6
     // On a 429, never reschedule sooner than this. A reading about to land would just get
     // rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
     static let rateLimitMinDelay: TimeInterval = 60 * 4 // 4 min
+    // Ceiling on the escalating recovery floor (see escalatedRecovery). Wide enough to
+    // skip 1–2 reading boundaries per poll so a drained account budget can rebuild,
+    // while still refreshing the Live Activity every few minutes.
+    static let maxRecoveryInterval: TimeInterval = 60 * 15 // 15 min
     // Longest server-provided Retry-After we'll honor. The header is authoritative for
     // when the limit clears, but a malformed or far-future value shouldn't park a
     // session past the point where its Live Activity has any data worth resuming.
@@ -550,9 +557,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     }
 
     /// Reschedules a session that hit a Dexcom rate limit (HTTP 429). Queues the next
-    /// poll for a reading boundary at least `rateLimitMinDelay` out — or the response's
-    /// `Retry-After` delay when Dexcom asks for a longer wait — skipping any reading
-    /// about to land, since retrying right before it just re-triggers the 429.
+    /// poll for a reading boundary at least the recovery floor out (never sooner than
+    /// `rateLimitMinDelay`, or the response's `Retry-After` when Dexcom asks for a longer
+    /// wait), skipping any reading about to land, since retrying right before it just
+    /// re-triggers the 429.
     private func rescheduleAfterRateLimit(
         app: Application,
         session: inout LiveActivityPollSession,
@@ -560,18 +568,18 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         sessionCapture: SessionCapture
     ) async {
         let retryAfter = Self.honoredRetryAfter(httpResponse)
-        let delay = Self.delayUntilNextReading(
-            after: session.lastReadingDate,
-            now: Date(),
-            minimumDelay: max(Self.rateLimitMinDelay, retryAfter)
-        )
 
         // Once the rate limit clears, ease back into polling instead of resuming the
         // aggressive overdue cadence, which tends to immediately re-trigger the 429.
-        // A Retry-After longer than the usual recovery start means the limit window is
-        // wide — keep the floor at least that wide too.
-        session.recoveryInterval = max(Self.recoveryStartInterval, retryAfter)
+        let recovery = Self.escalatedRecovery(current: session.recoveryInterval, retryAfter: retryAfter)
+        session.recoveryInterval = recovery
         session.retryCount += 1
+
+        let delay = Self.delayUntilNextReading(
+            after: session.lastReadingDate,
+            now: Date(),
+            minimumDelay: max(Self.rateLimitMinDelay, recovery)
+        )
 
         await reschedule(
             app: app,
@@ -590,6 +598,18 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// callers can take `max` with their own floors.
     static func honoredRetryAfter(_ httpResponse: DexcomHTTPResponse?) -> TimeInterval {
         min(httpResponse?.retryAfter ?? 0, maxRetryAfter)
+    }
+
+    /// The post-429 recovery floor after a rate-limited response. The first 429 starts
+    /// at `recoveryStartInterval`; a 429 arriving while a floor is already active means
+    /// the account's budget is still exhausted at the current spacing (Dexcom's limiter
+    /// refills at roughly the reading cadence, so a drained budget can't absorb even
+    /// boundary polls), so the floor doubles — capped at `maxRecoveryInterval`, where
+    /// polls skip 1–2 reading boundaries and the budget rebuilds. A server-provided
+    /// `Retry-After` longer than all of that wins outright.
+    static func escalatedRecovery(current: TimeInterval?, retryAfter: TimeInterval) -> TimeInterval {
+        let doubled = min((current ?? 0) * 2, maxRecoveryInterval)
+        return max(recoveryStartInterval, max(retryAfter, doubled))
     }
 
     private func handleGenericError(
@@ -664,28 +684,26 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// Nightscout's share2 bridge polls flat every 2.5 min). Past the window the reading
     /// is genuinely missing (sensor gap, phone offline), so aim for each subsequent
     /// reading boundary instead — phase-anchored to the last reading, so a resumed stream
-    /// is picked up seconds after it lands rather than minutes. A post-429
-    /// `recoveryInterval` floors both paths so recovery overrides the quick cadence.
+    /// is picked up seconds after it lands rather than minutes. An active post-429
+    /// `recoveryInterval` disables the quick cadence entirely: extra polls are what drew
+    /// the 429, so a recovering session only polls at reading boundaries at least the
+    /// floor apart until recovery clears.
     static func overdueReschedule(
         lastReadingDate: Date,
         now: Date,
         previousPollInterval: TimeInterval,
         recoveryInterval: TimeInterval?
     ) -> (delay: TimeInterval, pollInterval: TimeInterval) {
-        let recoveryFloor = recoveryInterval ?? 0
         let timeSinceLastReading = now.timeIntervalSince(lastReadingDate)
-        if timeSinceLastReading < readingInterval + overdueCatchupWindow {
+        if recoveryInterval == nil, timeSinceLastReading < readingInterval + overdueCatchupWindow {
             // Catch-up rechecks are the only polls scheduled with a sub-minute spacing,
             // so a larger previous spacing means this poll wasn't one — it's the boundary
-            // poll itself, and its miss is the first recheck opportunity. (A recovery
-            // floor can misclassify a recheck as first, but then the floor dominates the
-            // cadence anyway.)
+            // poll itself, and its miss is the first recheck opportunity.
             let isFirstRecheck = previousPollInterval > overdueRetryInterval
             let cadence = isFirstRecheck ? overdueFirstRetryInterval : overdueRetryInterval
-            let interval = Swift.max(cadence, recoveryFloor)
-            return (interval, interval)
+            return (cadence, cadence)
         }
-        let delay = delayUntilNextReading(after: lastReadingDate, now: now, minimumDelay: recoveryFloor)
+        let delay = delayUntilNextReading(after: lastReadingDate, now: now, minimumDelay: recoveryInterval ?? 0)
         return (delay, readingInterval)
     }
 

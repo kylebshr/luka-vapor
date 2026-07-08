@@ -142,19 +142,51 @@ struct LukaVaporTests {
         #expect(deepGap.pollInterval == LiveActivityScheduler.readingInterval)
     }
 
-    @Test("Post-429 recovery floor overrides the quick overdue cadence")
+    @Test("Post-429 recovery disables the quick overdue cadence")
     func overdueRespectsRecoveryFloor() {
-        // Inside the catch-up window but recovering from a rate limit: the recovery
-        // floor wins over the quick cadence.
+        // Inside the catch-up window but recovering from a rate limit: no quick rechecks
+        // (extra polls are what drew the 429) — aim for the next reading boundary at
+        // least the recovery floor away.
         let recovering = overdue(
             after: LiveActivityScheduler.readingInterval + 20,
             recovery: LiveActivityScheduler.recoveryStartInterval
         )
-        #expect(recovering.delay == LiveActivityScheduler.recoveryStartInterval)
+        #expect(recovering.delay == 280 + LiveActivityScheduler.readingPropagationBuffer)
+        #expect(recovering.pollInterval == LiveActivityScheduler.readingInterval)
+
+        // Even a mostly-decayed floor suppresses the quick cadence: what would have been
+        // a 30s recheck waits for the boundary instead.
+        let decayed = overdue(
+            after: LiveActivityScheduler.readingInterval + 50,
+            previous: LiveActivityScheduler.overdueRetryInterval,
+            recovery: 120
+        )
+        #expect(decayed.delay == 250 + LiveActivityScheduler.readingPropagationBuffer)
 
         // Past the window, a boundary sooner than the floor is skipped for the next one.
         let boundarySkipped = overdue(after: 450, recovery: 240)
         #expect(boundarySkipped.delay == 450 + LiveActivityScheduler.readingPropagationBuffer) // 15:00 boundary, not 10:00
+    }
+
+    @Test("Repeated 429s escalate the recovery floor to a cap")
+    func recoveryEscalation() {
+        // First 429: the floor starts at recoveryStartInterval; a short Retry-After
+        // doesn't shrink it.
+        #expect(LiveActivityScheduler.escalatedRecovery(current: nil, retryAfter: 30)
+            == LiveActivityScheduler.recoveryStartInterval)
+
+        // A 429 while a floor is already active: the account budget is still exhausted
+        // at the current spacing, so the floor doubles...
+        #expect(LiveActivityScheduler.escalatedRecovery(current: 300, retryAfter: 0) == 600)
+        // ...up to the cap, where polls skip reading boundaries and the budget rebuilds.
+        #expect(LiveActivityScheduler.escalatedRecovery(current: 600, retryAfter: 0)
+            == LiveActivityScheduler.maxRecoveryInterval)
+        #expect(LiveActivityScheduler.escalatedRecovery(
+            current: LiveActivityScheduler.maxRecoveryInterval, retryAfter: 0
+        ) == LiveActivityScheduler.maxRecoveryInterval)
+
+        // A server-provided Retry-After longer than the escalated floor wins outright.
+        #expect(LiveActivityScheduler.escalatedRecovery(current: 300, retryAfter: 1200) == 1200)
     }
 
     @Test("Recovery floor decays toward minInterval then clears")
