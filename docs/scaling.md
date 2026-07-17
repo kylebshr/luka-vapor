@@ -58,9 +58,15 @@ Example: going from 3 workers to 4.
 
    ```bash
    fly machines list -a luka-vapor-v2                       # started machine ID for worker3
-   fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2
+   fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2 -y
+   fly machine restart <started-machine-id> -a luka-vapor-v2   # apply the IP (see note)
    fly machines egress-ip list -a luka-vapor-v2             # one distinct IPv4 per worker
    ```
+
+   **Restart after allocating.** If the machine booted before the IP was allocated, it keeps
+   egressing from shared NAT until it reconnects — restart it, then confirm the new `boot`
+   event's `egress_ip` matches the allocated IPv4 (not the shared-NAT address the first boot
+   logged).
 
 4. Verify in logs/Axiom (see “Verifying a change” below).
 
