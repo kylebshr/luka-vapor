@@ -1,5 +1,8 @@
 # Scaling the polling fleet
 
+> For the step-by-step operational checklist (with the diagnostic Axiom queries), use the
+> `scale-polling-fleet` skill in `.claude/skills/`. This doc is the reference behind it.
+
 ## How polling is distributed
 
 All Dexcom polling is sharded across dedicated worker machines, each with its own
@@ -38,19 +41,25 @@ Example: going from 3 workers to 4.
      SHARD_COUNT = '4'
    ```
 
-2. Deploy and scale the new group to exactly one machine:
+2. Deploy. Merging the fly.toml change to `main` deploys it (Fly GitHub integration) and
+   creates the new worker machine. To deploy out of band instead:
 
    ```bash
-   fly deploy
-   fly scale count worker3=1 -a luka-vapor-v2 -y
+   fly deploy --ha=false -a luka-vapor-v2
    ```
 
-3. Allocate the new worker's static egress IP and verify every worker has one:
+   Pass `--ha=false` so Fly creates **one** machine per new group. Without it, each group
+   also gets a **stopped standby** machine. The standby is harmless for correctness —
+   `auto_start_machines = false` means only the started machine runs the scheduler — but it
+   clutters `machines list` and you must skip it in the next step.
+
+3. Allocate the new worker's static egress IP to its **started** machine, and verify every
+   worker has a distinct one:
 
    ```bash
-   fly machines list -a luka-vapor-v2                       # find worker3's machine ID
-   fly machines egress-ip allocate <machine-id> -a luka-vapor-v2
-   fly machines egress-ip list -a luka-vapor-v2             # one distinct IP per worker
+   fly machines list -a luka-vapor-v2                       # started machine ID for worker3
+   fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2
+   fly machines egress-ip list -a luka-vapor-v2             # one distinct IPv4 per worker
    ```
 
 4. Verify in logs/Axiom (see “Verifying a change” below).
