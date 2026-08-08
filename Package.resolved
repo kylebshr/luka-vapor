@@ -1,5 +1,5 @@
 {
-  "originHash" : "809ed1f408d75cac2520da659d02df506acc588549fd5485cb4ca66af1056b9c",
+  "originHash" : "b457f64edd1195f54533aa07b1800581a5a58edb9effaaa3858c1fdd264e40d6",
   "pins" : [
     {
       "identity" : "apns",
@@ -51,8 +51,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/kylebshr/dexcom-swift",
       "state" : {
-        "branch" : "main",
-        "revision" : "3c4d707e818437d0319ccd96ae87fd681a816520"
+        "branch" : "claude/libre-support-feasibility-3q8bth",
+        "revision" : "1c82b6604a0a6327ebd9cdc97839b7fa58667e01"
       }
     },
     {

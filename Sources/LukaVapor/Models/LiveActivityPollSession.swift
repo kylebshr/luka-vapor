@@ -1,5 +1,6 @@
 import Foundation
 import Dexcom
+import Libre
 @preconcurrency import Redis
 
 /// One entry per Live Activity in a poll session.
@@ -38,13 +39,16 @@ struct LiveActivityTokenEntry: Codable, Sendable {
     }
 }
 
-/// One per username — holds shared Dexcom polling state and all device tokens.
+/// One per username — holds shared CGM polling state and all device tokens.
 struct LiveActivityPollSession: Codable, Sendable {
     let username: String
     var password: String
+    let provider: CGMProvider
     var accountID: UUID?
     var sessionID: UUID?
-    let accountLocation: AccountLocation
+    // nil for Libre sessions, which have no account location.
+    let accountLocation: AccountLocation?
+    var libreSession: LibreSession?
 
     var tokens: [LiveActivityTokenEntry]
 
@@ -67,6 +71,19 @@ struct LiveActivityPollSession: Codable, Sendable {
 
 extension LiveActivityPollSession {
     var logID: String { username.redactedEmailLogID }
+
+    /// The Dexcom session, stored as its two IDs for compatibility with
+    /// pre-`DexcomSession` state already in Redis.
+    var dexcomSession: DexcomSession? {
+        get {
+            guard let accountID, let sessionID else { return nil }
+            return DexcomSession(accountID: accountID, sessionID: sessionID)
+        }
+        set {
+            accountID = newValue?.accountID
+            sessionID = newValue?.sessionID
+        }
+    }
 }
 
 extension String {
@@ -127,7 +144,10 @@ enum LiveActivityPollKeys {
     /// Route-owned credentials.
     struct Cred: Codable {
         var password: String
-        var accountLocation: AccountLocation
+        // Both optional for backwards compatibility with entries already in
+        // Redis: a missing provider means Dexcom, which always has a location.
+        var provider: CGMProvider?
+        var accountLocation: AccountLocation?
     }
 
     /// Scheduler-owned polling state. The scheduler is the sole writer after a session is
@@ -135,6 +155,7 @@ enum LiveActivityPollKeys {
     struct State: Codable {
         var accountID: UUID?
         var sessionID: UUID?
+        var libreSession: LibreSession?
         var sessionStartDate: Date?
         var lastReadingDate: Date?
         var lastReading: GlucoseReading?
@@ -147,6 +168,7 @@ enum LiveActivityPollKeys {
         init(from session: LiveActivityPollSession) {
             accountID = session.accountID
             sessionID = session.sessionID
+            libreSession = session.libreSession
             sessionStartDate = session.sessionStartDate
             lastReadingDate = session.lastReadingDate
             lastReading = session.lastReading
@@ -178,9 +200,9 @@ enum LiveActivityPollKeys {
     }
 
     /// Writes the credentials field and refreshes the TTL.
-    static func saveCred(for username: String, password: String, accountLocation: AccountLocation, on client: any RedisClient) async throws {
+    static func saveCred(for username: String, password: String, provider: CGMProvider, accountLocation: AccountLocation?, on client: any RedisClient) async throws {
         let key = dataKey(for: username)
-        let cred = Cred(password: password, accountLocation: accountLocation)
+        let cred = Cred(password: password, provider: provider, accountLocation: accountLocation)
         _ = try await client.hset(credField, to: try encodeJSON(cred), in: key).get()
         try await refreshTTL(for: key, on: client)
     }
@@ -232,9 +254,11 @@ enum LiveActivityPollKeys {
             let session = LiveActivityPollSession(
                 username: username,
                 password: cred.password,
+                provider: cred.provider ?? .dexcom,
                 accountID: state.accountID,
                 sessionID: state.sessionID,
                 accountLocation: cred.accountLocation,
+                libreSession: state.libreSession,
                 tokens: tokens,
                 sessionStartDate: state.sessionStartDate,
                 lastReadingDate: state.lastReadingDate,

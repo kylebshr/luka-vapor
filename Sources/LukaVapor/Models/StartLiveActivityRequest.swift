@@ -26,9 +26,14 @@ struct StartLiveActivityRequest: Codable, Sendable {
     var environment: PushEnvironment
     var username: String
     var password: String
+    // Which API the credentials are for. Optional for backwards compatibility —
+    // older clients don't send it and are always Dexcom.
+    var provider: CGMProvider?
     var accountID: UUID?
     var sessionID: UUID?
-    var accountLocation: AccountLocation
+    // Optional for backwards compatibility on the wire: Dexcom clients always
+    // send it; Libre clients have no account location.
+    var accountLocation: AccountLocation?
     var duration: TimeInterval
     var preferences: LiveActivityPreferences?
     // Stable per-activity identity (ActivityKit's `Activity.id`). Sent on every call —
