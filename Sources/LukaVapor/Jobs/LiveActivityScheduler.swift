@@ -5,6 +5,7 @@ import Vapor
 import Queues
 @preconcurrency import Redis
 import Dexcom
+import Libre
 import APNS
 import APNSCore
 import VaporAPNS
@@ -31,17 +32,35 @@ private final class IdleHeartbeat: @unchecked Sendable {
     }
 }
 
-// Captures session IDs when DexcomClient logs in
-private final class SessionCapture: DexcomClientDelegate, @unchecked Sendable {
-    var accountID: UUID?
-    var sessionID: UUID?
+/// Captures sessions delivered by a client's `onSessionChange` callback, so the
+/// scheduler can persist them with the polling state after the poll completes.
+private final class SessionCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _dexcomSession: DexcomSession?
+    private var _libreSession: LibreSession?
 
-    func didUpdateAccountID(_ accountID: UUID) {
-        self.accountID = accountID
+    var dexcomSession: DexcomSession? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _dexcomSession
     }
 
-    func didUpdateSessionID(_ sessionID: UUID) {
-        self.sessionID = sessionID
+    var libreSession: LibreSession? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _libreSession
+    }
+
+    func record(_ session: DexcomSession) {
+        lock.lock()
+        defer { lock.unlock() }
+        _dexcomSession = session
+    }
+
+    func record(_ session: LibreSession) {
+        lock.lock()
+        defer { lock.unlock() }
+        _libreSession = session
     }
 }
 
@@ -67,6 +86,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     // budget — enough extra load to re-trigger per-account 429s. 20s keeps the boundary
     // poll reliable so the quick rechecks stay the exception.
     static let readingPropagationBuffer: TimeInterval = 20
+    // LibreLinkUp serves a fresh minute-cadence reading on nearly every request, so
+    // Libre sessions poll on a flat one-minute cadence — no boundary math or catch-up
+    // rechecks. The small buffer keeps a poll from landing just before the minute rolls.
+    static let libreReadingInterval: TimeInterval = 60
+    static let libreReadingPropagationBuffer: TimeInterval = 5
     static let offlineInterval: TimeInterval = 60 * 15 // 15 minutes — when a reading is considered offline
     static let minStaleDateBuffer: TimeInterval = 60 * 2 // floor on staleDate so it's never in the past or near-now
     // Max lifetime of a Live Activity before the server ends it. Supported by all builds.
@@ -276,24 +300,35 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 return
             }
 
-            // 2. Poll Dexcom.
+            // 2. Poll the provider. Readings come back sorted oldest-first.
             let sessionCapture = SessionCapture()
-            let client = DexcomClient(
-                username: session.username,
-                password: session.password,
-                existingAccountID: session.accountID,
-                existingSessionID: session.sessionID,
-                accountLocation: session.accountLocation
-            )
-            await client.setDelegate(sessionCapture)
 
             let pollStart = Date()
             let pollResult: Result<[GlucoseReading], any Error>
             do {
                 app.logger.info("🔄 \(session.logID) Checking for new readings")
-                let readings = try await client.getGlucoseReadings(
-                    duration: .init(value: 24, unit: .hours)
-                ).sorted { $0.date < $1.date }
+                let readings: [GlucoseReading]
+                switch session.provider {
+                case .dexcom:
+                    let client = DexcomClient(
+                        username: session.username,
+                        password: session.password,
+                        existingSession: session.dexcomSession,
+                        accountLocation: session.accountLocation ?? .usa,
+                        onSessionChange: { sessionCapture.record($0) }
+                    )
+                    readings = try await client.getGlucoseReadings(
+                        duration: .init(value: 24, unit: .hours)
+                    )
+                case .libre:
+                    let client = LibreClient(
+                        email: session.username,
+                        password: session.password,
+                        existingSession: session.libreSession,
+                        onSessionChange: { sessionCapture.record($0) }
+                    )
+                    readings = try await client.getGlucoseReadings()
+                }
                 pollResult = .success(readings)
             } catch {
                 pollResult = .failure(error)
@@ -306,15 +341,18 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             let pollMeta: (outcome: String, status: String, endpoint: String) = switch pollResult {
             case .success(let readings):
                 (readings.isEmpty ? "empty" : "success", "200", "readings")
-            case .failure(let error as DexcomDecodingError):
+            case .failure(let error as ResponseDecodingError):
                 ("error", error.statusCode?.description ?? "unknown", error.url?.lastPathComponent ?? "unknown")
             case .failure(let error as DexcomError):
+                ("error", error.httpResponse?.statusCode.description ?? "unknown", error.httpResponse?.url?.lastPathComponent ?? "unknown")
+            case .failure(let error as LibreError):
                 ("error", error.httpResponse?.statusCode.description ?? "unknown", error.httpResponse?.url?.lastPathComponent ?? "unknown")
             case .failure:
                 ("error", "unknown", "unknown")
             }
             app.axiom?.emit("poll", attributes: [
                 "user": session.logID,
+                "provider": session.provider.rawValue,
                 "outcome": pollMeta.outcome,
                 "status_code": pollMeta.status,
                 "endpoint": pollMeta.endpoint,
@@ -409,6 +447,39 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "will_end": "true",
             ])
             await endAllTokens(app: app, session: session, reason: .dexcomError)
+        } catch let error as LibreClientError {
+            // Client-side states that polling again can't fix — a mis-registered
+            // session or an account with no accepted connections.
+            app.logger.error("\(session.logID) Ending all tokens due to LibreClientError: \(error)")
+            app.axiom?.emit("poll_error", attributes: [
+                "user": session.logID,
+                "error_type": "client",
+                "error": String(describing: error),
+                "retry_count": String(session.retryCount),
+                "will_end": "true",
+            ])
+            await endAllTokens(app: app, session: session, reason: .libreError)
+        } catch let error as LibreError where error.isRateLimited {
+            // LibreLinkUp rate limits with both 429 and the nonstandard 430.
+            // Back off the same way as a Dexcom 429. Auth failures and other
+            // API errors fall through to the generic handler, which retries
+            // with backoff and ends the session after the retry limit.
+            app.axiom?.emit("poll_error", attributes: [
+                "user": session.logID,
+                "error_type": "libre",
+                "status_code": error.httpResponse?.statusCode.description ?? "unknown",
+                "retry_after": error.httpResponse?.retryAfter.map { String(Int($0)) } ?? "none",
+                "retry_after_header": error.httpResponse?.value(forHTTPHeaderField: "Retry-After") ?? "none",
+                "retry_count": String(session.retryCount),
+                "will_end": "false",
+            ])
+            await rescheduleAfterRateLimit(
+                app: app,
+                session: &session,
+                httpResponse: error.httpResponse,
+                sessionCapture: sessionCapture
+            )
+            await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "Rate limited")
         } catch let error as DexcomError where error.httpResponse?.statusCode == 429 {
             // A rate limit whose body decoded as a Dexcom JSON error (app-level limiting,
             // vs. the Cloudflare HTML pages that surface as DexcomDecodingError). Back off
@@ -431,7 +502,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 sessionCapture: sessionCapture
             )
             await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "Rate limited")
-        } catch let error as DexcomDecodingError {
+        } catch let error as ResponseDecodingError {
             app.axiom?.emit("poll_error", attributes: [
                 "user": session.logID,
                 "error_type": "decoding",
@@ -523,12 +594,12 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     private func handleDecodingError(
         app: Application,
         session: inout LiveActivityPollSession,
-        error: DexcomDecodingError,
+        error: ResponseDecodingError,
         sessionCapture: SessionCapture
     ) async {
         let bodyString = String(data: error.body, encoding: .utf8) ?? "<non-utf8 data, \(error.body.count) bytes>"
         let statusCode = error.statusCode?.description ?? "unknown"
-        app.logger.error("🚫 \(session.logID) DexcomDecodingError status: \(statusCode) body: \(bodyString)")
+        app.logger.error("🚫 \(session.logID) ResponseDecodingError status: \(statusCode) body: \(bodyString)")
 
         if session.pollInterval >= Self.maxInterval && session.retryCount > Self.decodingErrorRetryLimit {
             app.logger.error("🤬 \(session.logID) Done retrying due to errors, ending all tokens")
@@ -564,7 +635,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     private func rescheduleAfterRateLimit(
         app: Application,
         session: inout LiveActivityPollSession,
-        httpResponse: DexcomHTTPResponse?,
+        httpResponse: HTTPResponseMetadata?,
         sessionCapture: SessionCapture
     ) async {
         let retryAfter = Self.honoredRetryAfter(httpResponse)
@@ -578,7 +649,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         let delay = Self.delayUntilNextReading(
             after: session.lastReadingDate,
             now: Date(),
-            minimumDelay: max(Self.rateLimitMinDelay, recovery)
+            minimumDelay: max(Self.rateLimitMinDelay, recovery),
+            readingInterval: Self.readingInterval(for: session.provider),
+            propagationBuffer: Self.propagationBuffer(for: session.provider)
         )
 
         await reschedule(
@@ -596,7 +669,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// The `Retry-After` delay to honor from a rate-limited response, capped at
     /// `maxRetryAfter`. Returns 0 when the response carried no usable header, so
     /// callers can take `max` with their own floors.
-    static func honoredRetryAfter(_ httpResponse: DexcomHTTPResponse?) -> TimeInterval {
+    static func honoredRetryAfter(_ httpResponse: HTTPResponseMetadata?) -> TimeInterval {
         min(httpResponse?.retryAfter ?? 0, maxRetryAfter)
     }
 
@@ -656,22 +729,41 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     static func delayUntilNextReading(
         after lastReadingDate: Date?,
         now: Date,
-        minimumDelay: TimeInterval = 0
+        minimumDelay: TimeInterval = 0,
+        readingInterval: TimeInterval = Self.readingInterval,
+        propagationBuffer: TimeInterval = Self.readingPropagationBuffer
     ) -> TimeInterval {
         guard let lastReadingDate else {
-            return Swift.max(readingInterval + readingPropagationBuffer, minimumDelay)
+            return Swift.max(readingInterval + propagationBuffer, minimumDelay)
         }
         let elapsed = now.timeIntervalSince(lastReadingDate)
         let cyclesElapsed = (elapsed / readingInterval).rounded(.down)
         // Start at the first reading boundary still in the future, then keep skipping
         // boundaries until the wait clears `minimumDelay`.
         var nextReadingDate = lastReadingDate.addingTimeInterval((cyclesElapsed + 1) * readingInterval)
-        var delay = nextReadingDate.timeIntervalSince(now) + readingPropagationBuffer
+        var delay = nextReadingDate.timeIntervalSince(now) + propagationBuffer
         while delay < minimumDelay {
             nextReadingDate.addTimeInterval(readingInterval)
-            delay = nextReadingDate.timeIntervalSince(now) + readingPropagationBuffer
+            delay = nextReadingDate.timeIntervalSince(now) + propagationBuffer
         }
         return delay
+    }
+
+    /// The expected spacing between new readings for a provider: Dexcom Share
+    /// serves a reading every 5 minutes, LibreLinkUp every minute.
+    static func readingInterval(for provider: CGMProvider) -> TimeInterval {
+        switch provider {
+        case .dexcom: readingInterval
+        case .libre: libreReadingInterval
+        }
+    }
+
+    /// Extra wait past a reading boundary before polling for it.
+    static func propagationBuffer(for provider: CGMProvider) -> TimeInterval {
+        switch provider {
+        case .dexcom: readingPropagationBuffer
+        case .libre: libreReadingPropagationBuffer
+        }
     }
 
     /// Scheduling decision for a poll that found the last reading overdue (due but not
@@ -728,7 +820,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     /// use `rescheduleWithoutNewReading` instead. Still respects an active post-429
     /// recovery floor.
     private static func overduePollCap(for session: LiveActivityPollSession) -> TimeInterval {
-        Swift.max(readingInterval, session.recoveryInterval ?? 0)
+        Swift.max(readingInterval(for: session.provider), session.recoveryInterval ?? 0)
     }
 
     // MARK: - Scheduling
@@ -746,7 +838,31 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     ) async {
         await sendStaleUpdatesIfNeeded(app: app, session: &session, now: now, reason: "No new readings")
 
-        if now.timeIntervalSince(lastDate) >= Self.readingInterval {
+        if now.timeIntervalSince(lastDate) >= Self.readingInterval(for: session.provider) {
+            // A flat cadence is already Libre's reading cadence, so an overdue
+            // reading gets no quick rechecks — just the next one-minute boundary
+            // (respecting any post-rate-limit recovery floor).
+            if session.provider == .libre {
+                let delay = Self.delayUntilNextReading(
+                    after: lastDate,
+                    now: now,
+                    minimumDelay: session.recoveryInterval ?? 0,
+                    readingInterval: Self.libreReadingInterval,
+                    propagationBuffer: Self.libreReadingPropagationBuffer
+                )
+                await reschedule(
+                    app: app,
+                    session: &session,
+                    pollInterval: Self.libreReadingInterval,
+                    lastReading: session.lastReading,
+                    readings: session.readings,
+                    delay: delay,
+                    sessionCapture: sessionCapture,
+                    resetRetries: false
+                )
+                return
+            }
+
             // No jitter here: rechecks are phase-anchored to each session's own reading
             // time, so cohorts don't synchronize — same as the boundary and 429 paths.
             let (delay, nextPollInterval) = Self.overdueReschedule(
@@ -788,8 +904,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         readings: [GlucoseReading]?,
         sessionCapture: SessionCapture
     ) async {
-        let timeUntilNextReading = Self.readingInterval - now.timeIntervalSince(readingDate)
-        let delay = timeUntilNextReading + Self.readingPropagationBuffer
+        let timeUntilNextReading = Self.readingInterval(for: session.provider) - now.timeIntervalSince(readingDate)
+        let delay = timeUntilNextReading + Self.propagationBuffer(for: session.provider)
         await reschedule(
             app: app,
             session: &session,
@@ -816,8 +932,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         session.lastReading = lastReading
         session.lastReadingDate = lastReading?.date
         session.readings = readings
-        session.accountID = sessionCapture.accountID ?? session.accountID
-        session.sessionID = sessionCapture.sessionID ?? session.sessionID
+        session.dexcomSession = sessionCapture.dexcomSession ?? session.dexcomSession
+        session.libreSession = sessionCapture.libreSession ?? session.libreSession
         if resetRetries {
             session.retryCount = 0
             // A healthy (non-error) poll — relax the post-rate-limit recovery floor a step.
@@ -857,6 +973,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
     private enum EndReason: String {
         case maxDuration
         case dexcomError
+        case libreError
         case apnsInvalidToken
         case tooManyRetries
     }

@@ -14,3 +14,12 @@ When modifying `LiveActivityJobPayload` or any other Queues job payload:
 - **Never make optional fields required** - Existing jobs in the Redis queue will fail to decode and be cancelled
 - Always add new fields as optional with a default/fallback
 - Consider backwards compatibility since jobs may be queued for minutes before executing
+
+## CGM Providers
+
+Live Activity sessions poll either Dexcom Share or LibreLinkUp (`CGMProvider`, stored in
+the session's `cred` field). A missing provider always means Dexcom — pre-Libre clients
+and Redis entries don't have one. Libre sessions share the same schedule key, Redis
+namespace, and shard routing as Dexcom, but poll on a flat one-minute cadence (readings
+arrive every minute) instead of the boundary/catch-up logic tuned for Dexcom's 5-minute
+readings, and treat both 429 and the nonstandard 430 as rate limits.

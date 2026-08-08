@@ -12,7 +12,7 @@ let package = Package(
         // 🔵 Non-blocking, event-driven networking for Swift. Used for custom executors
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/swift-server-community/APNSwift", branch: "main"),
-        .package(url: "https://github.com/kylebshr/dexcom-swift", branch: "main"),
+        .package(url: "https://github.com/kylebshr/dexcom-swift", branch: "claude/libre-support-feasibility-3q8bth"),
         .package(url: "https://github.com/vapor/apns", from: "5.0.0"),
         .package(url: "https://github.com/vapor/redis.git", from: "4.14.0"),
         .package(url: "https://github.com/vapor/queues-redis-driver.git", from: "1.1.2"),
@@ -26,6 +26,7 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "APNS", package: "APNSwift"),
                 .product(name: "Dexcom", package: "dexcom-swift"),
+                .product(name: "Libre", package: "dexcom-swift"),
                 .product(name: "VaporAPNS", package: "apns"),
                 .product(name: "Redis", package: "redis"),
                 .product(name: "QueuesRedisDriver", package: "queues-redis-driver"),
