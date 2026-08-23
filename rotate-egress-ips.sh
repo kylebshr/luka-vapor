@@ -102,7 +102,14 @@ for row in "${WORKERS[@]}"; do
   fly machine egress-ip release  "$id" -a "$APP" --yes || true
   echo "-- allocating fresh egress IP"
   fly machine egress-ip allocate "$id" -a "$APP" --yes
-  echo "-- verifying outbound (new keep-alive connections; stale ones may still 500/-1001 briefly)"
+  # CRITICAL: restart to flush connection pools. URLSession.shared (CGM polling) and
+  # async-http-client (Axiom) both pool keep-alive connections pinned to the OLD egress
+  # IP. Without a restart the app keeps reusing those now-dead connections and every
+  # reuse hangs to its timeout — NSURLError -1001 on polls, connectTimeout on Axiom —
+  # so a rotate-without-restart looks like it "didn't fix" the outage. See docs/scaling.md.
+  echo "-- restarting to flush stale connection pools"
+  fly machine restart "$id" -a "$APP"
+  echo "-- verifying outbound (allow ~30s for boot + first poll cycle)"
   if probe "$id" | tee /dev/stderr | grep -q 'FAIL'; then
     echo "!! $group still failing outbound — investigate before moving on" >&2
     fail=1

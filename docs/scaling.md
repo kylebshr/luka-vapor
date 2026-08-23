@@ -152,9 +152,18 @@ time and verifies reachability after each:
 ./rotate-egress-ips.sh <id>     # just one worker
 ```
 
-Reachability is restored immediately on reallocation (no restart needed); a few trailing
-`-1001` / Axiom-timeout log lines right after are just pre-existing keep-alive connections
-draining. If reallocation doesn't fix it, the next steps are destroying + recreating the
+**A rotate must be followed by a machine restart.** Reallocating the IP restores raw
+reachability, but the running process keeps two connection pools — `URLSession.shared`
+(CGM polling) and async-http-client (Axiom) — full of keep-alive connections pinned to the
+*old* egress IP. The app keeps reusing those now-dead connections, and every reuse hangs
+to its timeout: `NSURLErrorDomain -1001` on polls, `HTTPClientError.connectTimeout` on
+Axiom ingest. So a rotate *without* a restart looks like it "didn't work" — polls keep
+timing out (~35–60% of them, worst on the least-frequently-polled sessions) even though
+`openssl s_client` from the box connects instantly on a fresh connection. `fly machine
+restart <id>` flushes both pools and clears it immediately. `rotate-egress-ips.sh` does
+this automatically after each reallocation; if you rotate by hand, restart the machine.
+
+If reallocation + restart doesn't fix it, the next steps are destroying + recreating the
 wedged machine (then reallocating), and failing that, treating it as a Fly platform
 incident. **Set the alert:** a shard with no `scheduler_tick` for >2 minutes (see
 "Verifying a change") is the earliest signal of this.
