@@ -78,9 +78,15 @@ allocate one to its **started** machine:
 
 ```bash
 fly machines list -a luka-vapor-v2          # note the STARTED machine ID for each new worker<i>
-fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2
+fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2 -y
+fly machine restart <started-machine-id> -a luka-vapor-v2   # REQUIRED — see below
 fly machines egress-ip list -a luka-vapor-v2   # verify one distinct IPv4 per worker
 ```
+
+**Restart after allocating.** A machine that booted before its egress IP was allocated
+keeps egressing from Fly's shared NAT until it reconnects. Restart it so its polls actually
+leave from the static IP — and confirm via a fresh `boot` event whose `egress_ip` equals
+the allocated IPv4 (see step 5), *not* the shared-NAT address the pre-allocation boot showed.
 
 Until this runs, the new worker polls from Fly's shared NAT pool (worse reputation than
 today), so do it right after the deploy. IPs persist across deploys but are released if a
