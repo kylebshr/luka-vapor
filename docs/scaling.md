@@ -108,6 +108,73 @@ periodic `fly machines egress-ip list` check, or an Axiom alert on a `boot` even
 When a merge *removes* a worker group, verify the machine is actually gone
 (`fly machines list`) and scale it to zero if it lingers.
 
+## Wedged egress IPs (outbound timeouts)
+
+**This has taken the whole polling fleet down.** Machine-scoped egress IPs can *wedge*:
+when Fly migrates a worker to a new host (or otherwise rebuilds its network namespace),
+the egress binding can silently break. The IP still shows as allocated in
+`fly machine egress-ip list`, but **all outbound traffic through it times out** — this is
+distinct from the "IP got released" case in the section above, and a `fly machine
+egress-ip list` check does **not** catch it because the allocation still looks fine.
+
+Symptoms (all at once, across every worker, and surviving a redeploy):
+
+- Every poll fails: `🚫 Error polling for session: Error Domain=NSURLErrorDomain
+  Code=-1001` (`-1001` = request timed out). Sessions eventually force-end with
+  `tooManyRetries`, so Live Activities stop updating.
+- `Axiom ingest failed: HTTPClientError.connectTimeout` in the Fly logs — the workers
+  can't reach Axiom either.
+- **In Axiom the worker telemetry goes dark**: `scheduler_tick`, `poll`, and `push_sent`
+  flatline while `session_started` keeps coming. That is misleading — those worker events
+  vanish because the workers can't *reach* Axiom, not because the scheduler stopped. Trust
+  the Fly logs (`fly logs --machine <id>`) over Axiom silence here.
+- The `app` machine is completely healthy throughout — it has no egress IP and uses
+  shared NAT, so its outbound path is unaffected. That app-healthy / workers-dead split
+  is the tell that this is an egress problem, not app code.
+
+Confirm it by comparing outbound reachability from a worker vs. the app machine (DNS
+still works; it's TCP that hangs):
+
+```bash
+probe='for t in share2.dexcom.com:443 api.axiom.co:443; do echo Q | timeout 12 \
+  openssl s_client -connect $t -servername ${t%:*} -brief >/dev/null 2>&1 \
+  && echo "$t OK" || echo "$t FAIL"; done'
+fly ssh console -a luka-vapor-v2 --machine <worker-id> -C "/bin/sh -c '$probe'"  # FAIL
+fly ssh console -a luka-vapor-v2 --machine <app-id>    -C "/bin/sh -c '$probe'"  # OK
+```
+
+Fix: release + reallocate each worker's egress IP (you get fresh IPs — fine, even good,
+for Dexcom's per-IP limits). Use the helper, which rotates every started worker one at a
+time and verifies reachability after each:
+
+```bash
+./rotate-egress-ips.sh          # all workers (prompts first); -y to skip, -n to dry-run
+./rotate-egress-ips.sh <id>     # just one worker
+```
+
+**A rotate must be followed by a machine restart.** Reallocating the IP restores raw
+reachability, but the running process keeps two connection pools — `URLSession.shared`
+(CGM polling) and async-http-client (Axiom) — full of keep-alive connections pinned to the
+*old* egress IP. The app keeps reusing those now-dead connections, and every reuse hangs
+to its timeout: `NSURLErrorDomain -1001` on polls, `HTTPClientError.connectTimeout` on
+Axiom ingest. So a rotate *without* a restart looks like it "didn't work" — polls keep
+timing out (~35–60% of them, worst on the least-frequently-polled sessions) even though
+`openssl s_client` from the box connects instantly on a fresh connection. `fly machine
+restart <id>` flushes both pools and clears it immediately. `rotate-egress-ips.sh` does
+this automatically after each reallocation; if you rotate by hand, restart the machine.
+
+If reallocation + restart doesn't fix it, the next steps are destroying + recreating the
+wedged machine (then reallocating), and failing that, treating it as a Fly platform
+incident. **Set the alert:** a shard with no `scheduler_tick` for >2 minutes (see
+"Verifying a change") is the earliest signal of this.
+
+> App-scoped egress IPs (`fly ips allocate-egress`) are Fly's more resilient alternative —
+> a pool owned by the app that survives machine recreation — but machines pick a pool IP
+> *at random*, which breaks the one-stable-IP-per-shard model this design relies on
+> (observed: with a fresh pool, every worker egressed through the *same* pool IP,
+> concentrating all Dexcom load on one IP). We deliberately stay on machine-scoped IPs and
+> rotate them when they wedge.
+
 ## Rules that keep this safe
 
 - **Exactly one machine per worker group.** `fly scale count worker1=2` would put two
