@@ -147,7 +147,6 @@ func routes(_ app: Application) throws {
         try await LiveActivityPollKeys.saveCred(
             for: body.username,
             password: body.password,
-            provider: body.provider ?? .dexcom,
             accountLocation: body.accountLocation,
             on: req.redis
         )
@@ -176,11 +175,9 @@ func routes(_ app: Application) throws {
             let session = LiveActivityPollSession(
                 username: body.username,
                 password: body.password,
-                provider: body.provider ?? .dexcom,
                 accountID: body.accountID,
                 sessionID: body.sessionID,
                 accountLocation: body.accountLocation,
-                libreSession: nil,
                 tokens: [tokenEntry],
                 sessionStartDate: Date.now,
                 pollInterval: LiveActivityScheduler.minInterval,
