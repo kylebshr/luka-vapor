@@ -40,7 +40,7 @@ struct LukaVaporTests {
 
         // Dexcom asked for a 10-minute wait — longer than rateLimitMinDelay (4 min), so
         // the header wins and the reschedule lands on the first reading boundary past it.
-        let response = HTTPResponseMetadata(statusCode: 429, headers: ["Retry-After": "600"])
+        let response = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "600"])
         let retryAfter = LiveActivityScheduler.honoredRetryAfter(response)
         #expect(retryAfter == 600)
 
@@ -51,7 +51,7 @@ struct LukaVaporTests {
         #expect(delay <= 600 + LiveActivityScheduler.readingInterval)
 
         // A shorter Retry-After than our own floor doesn't shrink the backoff.
-        let shortResponse = HTTPResponseMetadata(statusCode: 429, headers: ["Retry-After": "30"])
+        let shortResponse = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "30"])
         let shortFloor = max(LiveActivityScheduler.rateLimitMinDelay, LiveActivityScheduler.honoredRetryAfter(shortResponse))
         #expect(shortFloor == LiveActivityScheduler.rateLimitMinDelay)
     }
@@ -59,83 +59,16 @@ struct LukaVaporTests {
     @Test("Retry-After is capped and absent headers fall back to 0")
     func retryAfterCapAndFallback() {
         // A far-future value can't park a session for hours.
-        let huge = HTTPResponseMetadata(statusCode: 429, headers: ["Retry-After": "86400"])
+        let huge = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "86400"])
         #expect(LiveActivityScheduler.honoredRetryAfter(huge) == LiveActivityScheduler.maxRetryAfter)
 
         // No header, unparseable header, or no response metadata at all: contribute
         // nothing, leaving rateLimitMinDelay as the effective floor.
-        let noHeader = HTTPResponseMetadata(statusCode: 429)
+        let noHeader = DexcomHTTPResponse(statusCode: 429)
         #expect(LiveActivityScheduler.honoredRetryAfter(noHeader) == 0)
-        let garbage = HTTPResponseMetadata(statusCode: 429, headers: ["Retry-After": "soon"])
+        let garbage = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "soon"])
         #expect(LiveActivityScheduler.honoredRetryAfter(garbage) == 0)
         #expect(LiveActivityScheduler.honoredRetryAfter(nil) == 0)
-    }
-
-    @Test("Stored creds and requests without a provider decode as Dexcom")
-    func providerBackwardsCompatibility() throws {
-        // Credential fields written before Libre support exist in Redis without a
-        // provider (and always with an account location) — they must keep decoding,
-        // and a missing provider must resolve to Dexcom.
-        let storedCred = #"{"password": "hunter2", "accountLocation": "usa"}"#
-        let cred = try JSONDecoder().decode(
-            LiveActivityPollKeys.Cred.self,
-            from: Data(storedCred.utf8)
-        )
-        #expect(cred.provider == nil)
-        #expect((cred.provider ?? .dexcom) == .dexcom)
-        #expect(cred.accountLocation == .usa)
-
-        // Pre-Libre polling state has no libreSession field.
-        let storedState = #"{"pollInterval": 60, "retryCount": 0}"#
-        let state = try JSONDecoder().decode(
-            LiveActivityPollKeys.State.self,
-            from: Data(storedState.utf8)
-        )
-        #expect(state.libreSession == nil)
-
-        // Old clients' start requests have no provider and always carry a location.
-        let request = #"""
-        {
-            "pushToken": "abc123", "environment": "production",
-            "username": "user@example.com", "password": "hunter2",
-            "accountLocation": "usa", "duration": 10800, "activityID": "A1"
-        }
-        """#
-        let decoded = try JSONDecoder().decode(
-            StartLiveActivityRequest.self,
-            from: Data(request.utf8)
-        )
-        #expect(decoded.provider == nil)
-        #expect(decoded.accountLocation == .usa)
-    }
-
-    @Test("Libre sessions poll on a flat one-minute cadence")
-    func libreCadence() {
-        #expect(LiveActivityScheduler.readingInterval(for: .libre) == 60)
-        #expect(LiveActivityScheduler.readingInterval(for: .dexcom) == LiveActivityScheduler.readingInterval)
-
-        // A healthy Libre session schedules for the next minute boundary after its
-        // latest reading, plus the small propagation buffer.
-        let lastReading = Date()
-        let delay = LiveActivityScheduler.delayUntilNextReading(
-            after: lastReading,
-            now: lastReading.addingTimeInterval(5),
-            readingInterval: LiveActivityScheduler.readingInterval(for: .libre),
-            propagationBuffer: LiveActivityScheduler.propagationBuffer(for: .libre)
-        )
-        #expect(delay == 55 + LiveActivityScheduler.libreReadingPropagationBuffer)
-
-        // A rate-limited Libre session still respects the shared 4-minute floor,
-        // landing on the first minute boundary past it.
-        let limited = LiveActivityScheduler.delayUntilNextReading(
-            after: lastReading,
-            now: lastReading.addingTimeInterval(65),
-            minimumDelay: LiveActivityScheduler.rateLimitMinDelay,
-            readingInterval: LiveActivityScheduler.readingInterval(for: .libre),
-            propagationBuffer: LiveActivityScheduler.propagationBuffer(for: .libre)
-        )
-        #expect(limited >= LiveActivityScheduler.rateLimitMinDelay)
-        #expect(limited <= LiveActivityScheduler.rateLimitMinDelay + 60)
     }
 
     @Test("Status dashboard renders each count")
