@@ -20,6 +20,7 @@ primary_region = 'sjc'
   worker2 = 'serve --env production --hostname 0.0.0.0 --port 8080'
   worker3 = 'serve --env production --hostname 0.0.0.0 --port 8080'
   worker4 = 'serve --env production --hostname 0.0.0.0 --port 8080'
+  worker5 = 'serve --env production --hostname 0.0.0.0 --port 8080'
 
 [http_service]
   internal_port = 8080
@@ -31,7 +32,7 @@ primary_region = 'sjc'
 
 [env]
   LOG_LEVEL = 'info'
-  SHARD_COUNT = '5'
+  SHARD_COUNT = '6'
 
 [[vm]]
   memory = '256mb'
