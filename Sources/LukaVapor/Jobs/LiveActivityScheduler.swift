@@ -197,6 +197,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 session = loaded
             case .missing:
                 app.logger.info("🗑️ Session \(username.prefix(8))... data not found, removing from schedule")
+                app.axiom?.emit("session_removed", attributes: [
+                    "user": username.redactedEmailLogID,
+                    "reason": "missing",
+                ])
                 await removeSession(app: app, username: username)
                 return
             case .undecodable:
@@ -219,6 +223,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             // 1. Per-token expiry: remove tokens past their max duration, send end to each.
             var expiredTokens: [LiveActivityTokenEntry] = []
+            var restartedCount = 0
             session.tokens.removeAll { token in
                 let duration = Self.maximumDuration
 
@@ -248,14 +253,16 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                     tokenCount: session.tokens.count,
                     dismiss: willRestart
                 )
-                await restartViaPushToStart(
+                if await restartViaPushToStart(
                     app: app,
                     token: token,
                     session: session,
                     seedLatestReading: seedLatestReading,
                     seedReadings: seedReadings,
                     now: now
-                )
+                ) {
+                    restartedCount += 1
+                }
                 app.axiom?.emit("push_ended", attributes: [
                     "user": session.logID,
                     "environment": token.environment.rawValue,
@@ -269,6 +276,15 @@ struct LiveActivityScheduler: AsyncScheduledJob {
 
             if session.tokens.isEmpty {
                 app.logger.info("🛑 \(session.logID) All tokens expired, removing session")
+                // The normal end of a 7-hour cycle. With `restarted_count` > 0 the device
+                // is expected to re-register within seconds (`restart_registered`); if it
+                // doesn't, this is the last event the user has until they start one by hand.
+                app.axiom?.emit("session_ended", attributes: [
+                    "user": session.logID,
+                    "reason": "all_tokens_expired",
+                    "expired_count": String(expiredTokens.count),
+                    "restarted_count": String(restartedCount),
+                ])
                 // Only tears down if no token field remains — a device that registered
                 // during this tick keeps the session alive for the next one. No Dexcom
                 // call was spent on this fully-expired session.
@@ -886,6 +902,11 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         _ = try? await LiveActivityPollKeys.pruneSession(for: session.username, on: app.redis)
 
         app.logger.info("🛑 \(session.logID) Session ended (\(session.tokens.count) tokens): \(reason.rawValue)")
+        app.axiom?.emit("session_ended", attributes: [
+            "user": session.logID,
+            "reason": reason.rawValue,
+            "token_count": String(session.tokens.count),
+        ])
     }
 
     /// Relaunch a fresh Live Activity on this device via push-to-start, seeded with the
@@ -906,7 +927,8 @@ struct LiveActivityScheduler: AsyncScheduledJob {
               let attributes = token.attributes else {
             return false
         }
-        await Self.sendStartEvent(
+        let pushToStartTokenUpdatedAt = token.pushToStartTokenUpdatedAt ?? token.startDate
+        let sent = await Self.sendStartEvent(
             app: app,
             pushToStartToken: pushToStartToken,
             environment: token.environment,
@@ -916,10 +938,26 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             readings: trim(readings: seedReadings, toDuration: token.duration, now: now),
             sessionStartDate: session.sessionStartDate,
             tokenCount: session.tokens.count,
+            pushToStartTokenUpdatedAt: pushToStartTokenUpdatedAt,
             now: now,
             logID: session.logID
         )
-        return true
+        if sent {
+            // Marker for the re-registration that should follow within seconds; consumed
+            // by `start-live-activity` to emit `restart_registered` with the latency.
+            try? await LiveActivityPollKeys.markRestartPending(
+                for: session.username,
+                .init(
+                    sentAt: now,
+                    pushToStartTokenPrefix: String(pushToStartToken.prefix(8)),
+                    pushToStartTokenUpdatedAt: pushToStartTokenUpdatedAt,
+                    environment: token.environment,
+                    source: "max_duration"
+                ),
+                on: app.redis
+            )
+        }
+        return sent
     }
 
     // MARK: - APNS
@@ -1205,9 +1243,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         readings: [GlucoseReading],
         sessionStartDate: Date?,
         tokenCount: Int,
+        pushToStartTokenUpdatedAt: Date?,
         now: Date,
         logID: String
-    ) async {
+    ) async -> Bool {
         let apnsClient = switch environment {
         case .development: await app.apns.client(.development)
         case .production: await app.apns.client(.production)
@@ -1269,12 +1308,18 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 pushToStartToken: pushToStartToken
             )
             app.logger.info("🔁 \(logID) Sent push-to-start to \(pushToStartToken.prefix(8))...")
+            // `push_started` only means APNs accepted the push. Whether the device acted on
+            // it is answered by a matching `restart_registered`. `pts_age_s` is how long ago
+            // the client last changed this push-to-start token — a stale token is one
+            // candidate for restarts that APNs accepts but the device never honors.
             app.axiom?.emit("push_started", attributes: [
                 "user": logID,
                 "environment": environment.rawValue,
                 "token_prefix": String(pushToStartToken.prefix(8)),
                 "kind": "push_to_start",
+                "pts_age_s": pushToStartTokenUpdatedAt.map { String(Int(now.timeIntervalSince($0))) } ?? "unknown",
             ])
+            return true
         } catch let error as APNSCore.APNSError {
             app.logger.error("\(logID) push-to-start failed: \(error)")
             app.axiom?.emit("push_failed", attributes: [
@@ -1285,6 +1330,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "error_type": "apns",
                 "apns_reason": error.reason?.reason ?? "unknown",
             ])
+            return false
         } catch {
             app.logger.error("\(logID) Unexpected error sending push-to-start: \(error)")
             app.axiom?.emit("push_failed", attributes: [
@@ -1295,6 +1341,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "error_type": "other",
                 "error": String(describing: type(of: error)),
             ])
+            return false
         }
     }
 

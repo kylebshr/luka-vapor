@@ -71,6 +71,37 @@ struct LukaVaporTests {
         #expect(LiveActivityScheduler.honoredRetryAfter(nil) == 0)
     }
 
+    @Test("Token entries written before pushToStartTokenUpdatedAt still decode")
+    func tokenEntryBackwardsCompatibility() throws {
+        let entry = LiveActivityTokenEntry(
+            pushToken: .init(rawValue: "abc123"),
+            environment: .production,
+            preferences: nil,
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            duration: 3600,
+            activityID: "activity-1",
+            pushToStartToken: "pts-token",
+            attributesType: "ReadingAttributes",
+            attributes: .object([:]),
+            pushToStartTokenUpdatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        // Round-trips with the new field intact.
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(LiveActivityTokenEntry.self, from: data)
+        #expect(decoded.pushToStartTokenUpdatedAt == entry.pushToStartTokenUpdatedAt)
+
+        // An entry already in Redis (no such key) must still decode — as nil, never as an
+        // error, since an undecodable token field would tear the whole session down.
+        var json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        json.removeValue(forKey: "pushToStartTokenUpdatedAt")
+        let legacyData = try JSONSerialization.data(withJSONObject: json)
+        let legacy = try JSONDecoder().decode(LiveActivityTokenEntry.self, from: legacyData)
+        #expect(legacy.pushToStartTokenUpdatedAt == nil)
+        #expect(legacy.activityID == "activity-1")
+        #expect(legacy.canRestartViaPushToStart)
+    }
+
     @Test("Status dashboard renders each count")
     func statusDashboardHTML() {
         let counts = LiveActivityPollKeys.ActivityCounts(sessions: 12, activities: 34, rateLimited: 5)

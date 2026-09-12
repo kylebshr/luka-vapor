@@ -29,6 +29,13 @@ struct LiveActivityTokenEntry: Codable, Sendable {
     let attributesType: String?
     let attributes: JSONValue?
 
+    // When the client last sent a *different* push-to-start token for this activity
+    // (preserved across re-registrations that carry the same token). Lets a restart push
+    // report how stale the token it targets is — a device that stopped honoring restarts
+    // after its token rotated shows up as a large age here. Optional: entries written
+    // before this field existed decode as nil.
+    var pushToStartTokenUpdatedAt: Date? = nil
+
     /// Whether this activity can be relaunched via push-to-start. True only when the client
     /// opted in and sent all three pieces needed to recreate the activity on-device — a start
     /// push with a missing/empty attributes object would fail to decode into the activity's
@@ -124,6 +131,27 @@ enum LiveActivityPollKeys {
 
     static func tokenField(_ activityID: String) -> String { tokenFieldPrefix + activityID }
 
+    /// Restart bookkeeping: set when a push-to-start restart is sent for a user, consumed by
+    /// the next `start-live-activity` so it can report how long the device took to come
+    /// back (`restart_registered`). Short TTL — a marker nobody consumed means the device
+    /// never restarted, which is the failure the `push_started` / `restart_registered`
+    /// mismatch surfaces in Axiom.
+    static let restartPendingPrefix = "live-activities:restart-pending:"
+    static let restartPendingTTLSeconds = 15 * 60
+
+    static func restartPendingKey(for username: String) -> RedisKey {
+        RedisKey("\(restartPendingPrefix)\(username)")
+    }
+
+    struct RestartPending: Codable {
+        var sentAt: Date
+        var pushToStartTokenPrefix: String
+        var pushToStartTokenUpdatedAt: Date?
+        var environment: PushEnvironment
+        /// What triggered the restart: `max_duration` or `debug`.
+        var source: String
+    }
+
     /// Route-owned credentials.
     struct Cred: Codable {
         var password: String
@@ -198,6 +226,33 @@ enum LiveActivityPollKeys {
         let key = dataKey(for: username)
         _ = try await client.hset(tokenField(token.activityID), to: try encodeJSON(token), in: key).get()
         try await refreshTTL(for: key, on: client)
+    }
+
+    /// Records that a push-to-start restart was just sent for this user.
+    static func markRestartPending(for username: String, _ pending: RestartPending, on client: any RedisClient) async throws {
+        _ = try await client.send(command: "SET", with: [
+            RESPValue(from: restartPendingKey(for: username).rawValue),
+            RESPValue(from: try encodeJSON(pending)),
+            RESPValue(from: "EX"),
+            RESPValue(from: String(restartPendingTTLSeconds)),
+        ]).get()
+    }
+
+    /// Atomically reads and clears the pending-restart marker, if any. Only the first
+    /// registration after a restart counts as the restart's re-registration.
+    static func takeRestartPending(for username: String, on client: any RedisClient) async throws -> RestartPending? {
+        let script = """
+        local value = redis.call('GET', KEYS[1])
+        if value then redis.call('DEL', KEYS[1]) end
+        return value
+        """
+        let result = try await client.send(command: "EVAL", with: [
+            RESPValue(from: script),
+            RESPValue(from: "1"),
+            RESPValue(from: restartPendingKey(for: username).rawValue),
+        ]).get()
+        guard let raw = result.string else { return nil }
+        return try? JSONDecoder().decode(RestartPending.self, from: Data(raw.utf8))
     }
 
     /// Removes one device's token field.
