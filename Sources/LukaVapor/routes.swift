@@ -80,7 +80,59 @@ func routes(_ app: Application) throws {
         } else {
             req.logger.info("⏹️  \(body.username.redactedEmailLogID) Removed token")
         }
+        // Client-initiated teardown was previously invisible in Axiom, so a session that
+        // went quiet was indistinguishable from a scheduler bug. `session_removed` says
+        // whether this call took the whole session down or just one device's token.
+        app.axiom?.emit("session_ended", attributes: [
+            "user": body.username.redactedEmailLogID,
+            "reason": "client_end",
+            "session_removed": removed ? "true" : "false",
+            "activity_prefix": String(body.activityID.prefix(8)),
+        ])
 
+        return .ok
+    }
+
+    // Client-side lifecycle observations (activity appeared, token arrived, send failed,
+    // app woke in the background, …), stamped with the device's own timestamps. Emitted as
+    // `client_event` rows so they line up with `push_started` / `restart_registered` for
+    // the same user. If a restart push is pending for this user, each row also carries how
+    // long after that push the observation happened.
+    app.post("client-event") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(ClientEventRequest.self)
+        let now = Date.now
+        let pending = try? await LiveActivityPollKeys.peekRestartPending(for: body.username, on: req.redis)
+        let appVersion = req.headers.first(name: "X-Luka-Version") ?? "unknown"
+        let appBuild = req.headers.first(name: "X-Luka-Build") ?? "unknown"
+        let clientTime = ISO8601DateFormatter()
+        clientTime.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        var emitted = 0
+        for event in body.events.prefix(ClientEventSanitizer.maxEvents) {
+            guard let name = ClientEventSanitizer.name(event.name) else { continue }
+            let occurredAt = Date(timeIntervalSince1970: event.occurredAt)
+
+            var attributes = ClientEventSanitizer.attributes(event.attributes)
+            attributes["user"] = body.logID
+            attributes["client_event"] = name
+            attributes["client_time"] = clientTime.string(from: occurredAt)
+            attributes["client_lag_s"] = String(Int(now.timeIntervalSince(occurredAt)))
+            attributes["app_version"] = appVersion
+            attributes["app_build"] = appBuild
+            attributes["os_version"] = body.systemVersion ?? "unknown"
+            attributes["device_model"] = body.deviceModel ?? "unknown"
+            if let activityID = event.activityID {
+                attributes["activity_prefix"] = String(activityID.prefix(8))
+            }
+            if let pending {
+                attributes["restart_source"] = pending.source
+                attributes["since_restart_s"] = String(Int(occurredAt.timeIntervalSince(pending.sentAt)))
+            }
+            app.axiom?.emit("client_event", attributes: attributes)
+            emitted += 1
+        }
+
+        req.logger.info("📱 \(body.logID) Recorded \(emitted) client event(s)")
         return .ok
     }
 
@@ -105,11 +157,37 @@ func routes(_ app: Application) throws {
         try await LiveActivityPollKeys.removeSession(body.username, on: req.redis)
 
         req.logger.info("⏹️  \(body.logID) Ended all sessions")
+        app.axiom?.emit("session_ended", attributes: [
+            "user": body.logID,
+            "reason": "client_end_all",
+            "session_removed": "true",
+        ])
 
         return .ok
     }
 
     app.post("start-live-activity") { req async throws -> HTTPStatus in
+        // A registration that fails here (undecodable body, Redis error) used to leave no
+        // trace beyond a Fly log line, so an activity the user just started that never got
+        // updates looked identical to one the app never registered. Surface it.
+        do {
+            return try await startLiveActivity(req, app: app)
+        } catch {
+            let username = (try? req.content.get(String.self, at: "username")) ?? ""
+            let version = req.headers.first(name: "X-Luka-Version") ?? "unknown"
+            req.logger.error("🆕 \(username.redactedEmailLogID) start-live-activity failed: \(error)")
+            app.axiom?.emit("session_start_failed", attributes: [
+                "user": username.isEmpty ? "unknown" : username.redactedEmailLogID,
+                "app_version": version,
+                "app_build": req.headers.first(name: "X-Luka-Build") ?? "unknown",
+                "error_type": String(describing: type(of: error)),
+                "error": String(String(describing: error).prefix(300)),
+            ])
+            throw error
+        }
+    }
+
+    func startLiveActivity(_ req: Request, app: Application) async throws -> HTTPStatus {
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
         let loaded = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis)
@@ -125,6 +203,37 @@ func routes(_ app: Application) throws {
         }
         let existingToken = existingSession?.tokens.first { $0.activityID == body.activityID }
 
+        // If a push-to-start restart was just sent for this user, this registration is the
+        // device coming back from it. Consume the marker first so exactly one registration
+        // is attributed to each restart.
+        let pendingRestart = try? await LiveActivityPollKeys.takeRestartPending(for: body.username, on: req.redis)
+
+        // Push-to-start token bookkeeping: which token the device currently advertises,
+        // whether it differs from the last registration of this activity, and when it last
+        // changed. A device whose restarts stopped landing after its token rotated shows up
+        // here as a token that never changes while `push_started` keeps targeting it.
+        let pushToStartPrefix = body.pushToStartToken.map { String($0.prefix(8)) } ?? "none"
+        let launchedByPush = body.pushToStart.map { $0 ? "true" : "false" } ?? "unknown"
+        let pushToStartChanged: String
+        let pushToStartTokenUpdatedAt: Date
+        if let existingToken {
+            if existingToken.pushToStartToken == body.pushToStartToken {
+                pushToStartChanged = "false"
+                pushToStartTokenUpdatedAt = existingToken.pushToStartTokenUpdatedAt ?? existingToken.startDate
+            } else {
+                pushToStartChanged = "true"
+                pushToStartTokenUpdatedAt = Date.now
+            }
+        } else if let pendingRestart, pendingRestart.pushToStartTokenPrefix == pushToStartPrefix {
+            // Fresh activity after a restart carrying the same token: keep the token's
+            // original age rather than resetting it on every 7-hour cycle.
+            pushToStartChanged = "false"
+            pushToStartTokenUpdatedAt = pendingRestart.pushToStartTokenUpdatedAt ?? pendingRestart.sentAt
+        } else {
+            pushToStartChanged = "none"
+            pushToStartTokenUpdatedAt = Date.now
+        }
+
         let tokenEntry = LiveActivityTokenEntry(
             pushToken: body.pushToken,
             environment: body.environment,
@@ -138,7 +247,8 @@ func routes(_ app: Application) throws {
             // by sending nil — there's no merge with a stored value.
             pushToStartToken: body.pushToStartToken,
             attributesType: body.attributesType,
-            attributes: body.attributes
+            attributes: body.attributes,
+            pushToStartTokenUpdatedAt: pushToStartTokenUpdatedAt
         )
 
         // Persist this device's token as its own field. Because it's an isolated HSET, a
@@ -197,6 +307,9 @@ func routes(_ app: Application) throws {
                 "token_prefix": String(body.pushToken.rawValue.prefix(8)),
                 "kind": "new",
                 "token_count": "1",
+                "pts_prefix": pushToStartPrefix,
+                "pts_changed": pushToStartChanged,
+                "launched_by_push": launchedByPush,
             ])
         } else {
             // Existing session: don't touch the scheduler-owned state. Ensure a schedule
@@ -222,6 +335,27 @@ func routes(_ app: Application) throws {
                 "token_prefix": String(body.pushToken.rawValue.prefix(8)),
                 "kind": "token_added",
                 "token_count": String(tokenCount),
+                "pts_prefix": pushToStartPrefix,
+                "pts_changed": pushToStartChanged,
+                "launched_by_push": launchedByPush,
+            ])
+        }
+
+        if let pendingRestart {
+            let latency = Date.now.timeIntervalSince(pendingRestart.sentAt)
+            req.logger.info("🔁 \(body.logID) Re-registered \(Int(latency))s after push-to-start restart")
+            // The positive half of restart tracking: `push_started` says APNs accepted the
+            // start push; this says the device actually relaunched and came back. A
+            // `push_started` with no `restart_registered` is a restart the device dropped.
+            app.axiom?.emit("restart_registered", attributes: [
+                "user": body.logID,
+                "environment": body.environment.rawValue,
+                "kind": existingSession == nil ? "new" : "token_added",
+                "source": pendingRestart.source,
+                "latency_s": String(Int(latency)),
+                "pts_prefix_sent": pendingRestart.pushToStartTokenPrefix,
+                "pts_prefix_now": pushToStartPrefix,
+                "launched_by_push": launchedByPush,
             ])
         }
 
@@ -269,7 +403,7 @@ func routes(_ app: Application) throws {
         let now = Date()
         let cachedReadings = session.readings ?? session.lastReading.map { [$0] } ?? []
         let cutoff = now.addingTimeInterval(-token.duration)
-        await LiveActivityScheduler.sendStartEvent(
+        let sent = await LiveActivityScheduler.sendStartEvent(
             app: app,
             pushToStartToken: pushToStartToken,
             environment: token.environment,
@@ -279,9 +413,23 @@ func routes(_ app: Application) throws {
             readings: cachedReadings.filter { $0.date >= cutoff },
             sessionStartDate: session.sessionStartDate,
             tokenCount: session.tokens.count,
+            pushToStartTokenUpdatedAt: token.pushToStartTokenUpdatedAt ?? token.startDate,
             now: now,
             logID: session.logID
         )
+        if sent {
+            try? await LiveActivityPollKeys.markRestartPending(
+                for: body.username,
+                .init(
+                    sentAt: now,
+                    pushToStartTokenPrefix: String(pushToStartToken.prefix(8)),
+                    pushToStartTokenUpdatedAt: token.pushToStartTokenUpdatedAt ?? token.startDate,
+                    environment: token.environment,
+                    source: "debug"
+                ),
+                on: req.redis
+            )
+        }
 
         return .ok
     }

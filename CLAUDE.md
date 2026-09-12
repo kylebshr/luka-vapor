@@ -20,3 +20,9 @@ When modifying `LiveActivityJobPayload` or any other Queues job payload:
 - **Never make optional fields required** - Existing jobs in the Redis queue will fail to decode and be cancelled
 - Always add new fields as optional with a default/fallback
 - Consider backwards compatibility since jobs may be queued for minutes before executing
+
+## Live Activity Restart Failures
+
+If a user's activity goes stale right at the 7-hour mark, check `push_started` vs
+`restart_registered` for that user in Axiom. Events, queries, and how to read them are in
+`docs/live-activity-restarts.md`.

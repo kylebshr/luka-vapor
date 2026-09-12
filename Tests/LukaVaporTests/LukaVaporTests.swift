@@ -1,4 +1,5 @@
 @testable import LukaVapor
+import APNSCore
 import Dexcom
 import VaporTesting
 import Testing
@@ -69,6 +70,80 @@ struct LukaVaporTests {
         let garbage = DexcomHTTPResponse(statusCode: 429, headers: ["Retry-After": "soon"])
         #expect(LiveActivityScheduler.honoredRetryAfter(garbage) == 0)
         #expect(LiveActivityScheduler.honoredRetryAfter(nil) == 0)
+    }
+
+    @Test("Token entries written before pushToStartTokenUpdatedAt still decode")
+    func tokenEntryBackwardsCompatibility() throws {
+        let entry = LiveActivityTokenEntry(
+            pushToken: .init(rawValue: "abc123"),
+            environment: .production,
+            preferences: nil,
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            duration: 3600,
+            activityID: "activity-1",
+            pushToStartToken: "pts-token",
+            attributesType: "ReadingAttributes",
+            attributes: .object([:]),
+            pushToStartTokenUpdatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        // Round-trips with the new field intact.
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(LiveActivityTokenEntry.self, from: data)
+        #expect(decoded.pushToStartTokenUpdatedAt == entry.pushToStartTokenUpdatedAt)
+
+        // An entry already in Redis (no such key) must still decode — as nil, never as an
+        // error, since an undecodable token field would tear the whole session down.
+        var json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        json.removeValue(forKey: "pushToStartTokenUpdatedAt")
+        let legacyData = try JSONSerialization.data(withJSONObject: json)
+        let legacy = try JSONDecoder().decode(LiveActivityTokenEntry.self, from: legacyData)
+        #expect(legacy.pushToStartTokenUpdatedAt == nil)
+        #expect(legacy.activityID == "activity-1")
+        #expect(legacy.canRestartViaPushToStart)
+    }
+
+    @Test("Client event names and attributes are bounded and can't spoof server fields")
+    func clientEventSanitizer() {
+        #expect(ClientEventSanitizer.name("activity_observed") == "activity_observed")
+        #expect(ClientEventSanitizer.name("Activity Observed") == nil)
+        #expect(ClientEventSanitizer.name("") == nil)
+        #expect(ClientEventSanitizer.name(String(repeating: "a", count: 41)) == nil)
+
+        let clean = ClientEventSanitizer.attributes([
+            "push_to_start": "true",
+            "user": "spoofed",            // reserved: dropped
+            "machine_id": "spoofed",      // reserved: dropped
+            "Bad Key": "x",               // malformed: dropped
+            "long": String(repeating: "v", count: 500),
+        ])
+        #expect(clean["push_to_start"] == "true")
+        #expect(clean["user"] == nil)
+        #expect(clean["machine_id"] == nil)
+        #expect(clean["Bad Key"] == nil)
+        #expect(clean["long"]?.count == ClientEventSanitizer.maxValueLength)
+
+        let many = Dictionary(uniqueKeysWithValues: (0..<40).map { ("k\($0)", "v") })
+        #expect(ClientEventSanitizer.attributes(many).count == ClientEventSanitizer.maxAttributes)
+        #expect(ClientEventSanitizer.attributes(nil).isEmpty)
+    }
+
+    @Test("Push-to-start payload asks iOS 18+ to wake the app with a fresh token")
+    func startPushCarriesInputPushToken() throws {
+        let notification = APNSStartLiveActivityNotification(
+            expiration: .immediately,
+            priority: .immediately,
+            appID: "com.example.app",
+            contentState: LiveActivityState(c: nil, h: [], se: false, pd: Date(), r: "Restarted"),
+            timestamp: 1_700_000_000,
+            attributes: JSONValue.object([:]),
+            attributesType: "ReadingAttributes",
+            alert: .init(title: .raw("Luka"), body: .raw("Glucose monitoring resumed")),
+            inputPushMethod: .token
+        )
+        let json = try #require(String(data: JSONEncoder().encode(notification), encoding: .utf8))
+        #expect(json.contains("\"input-push-token\":1"))
+        #expect(json.contains("\"event\":\"start\""))
     }
 
     @Test("Status dashboard renders each count")
