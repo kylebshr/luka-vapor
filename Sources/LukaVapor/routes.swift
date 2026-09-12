@@ -167,6 +167,27 @@ func routes(_ app: Application) throws {
     }
 
     app.post("start-live-activity") { req async throws -> HTTPStatus in
+        // A registration that fails here (undecodable body, Redis error) used to leave no
+        // trace beyond a Fly log line, so an activity the user just started that never got
+        // updates looked identical to one the app never registered. Surface it.
+        do {
+            return try await startLiveActivity(req, app: app)
+        } catch {
+            let username = (try? req.content.get(String.self, at: "username")) ?? ""
+            let version = req.headers.first(name: "X-Luka-Version") ?? "unknown"
+            req.logger.error("🆕 \(username.redactedEmailLogID) start-live-activity failed: \(error)")
+            app.axiom?.emit("session_start_failed", attributes: [
+                "user": username.isEmpty ? "unknown" : username.redactedEmailLogID,
+                "app_version": version,
+                "app_build": req.headers.first(name: "X-Luka-Build") ?? "unknown",
+                "error_type": String(describing: type(of: error)),
+                "error": String(String(describing: error).prefix(300)),
+            ])
+            throw error
+        }
+    }
+
+    func startLiveActivity(_ req: Request, app: Application) async throws -> HTTPStatus {
         let body = try req.content.decode(StartLiveActivityRequest.self)
 
         let loaded = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis)

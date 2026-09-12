@@ -1,4 +1,5 @@
 @testable import LukaVapor
+import APNSCore
 import Dexcom
 import VaporTesting
 import Testing
@@ -125,6 +126,24 @@ struct LukaVaporTests {
         let many = Dictionary(uniqueKeysWithValues: (0..<40).map { ("k\($0)", "v") })
         #expect(ClientEventSanitizer.attributes(many).count == ClientEventSanitizer.maxAttributes)
         #expect(ClientEventSanitizer.attributes(nil).isEmpty)
+    }
+
+    @Test("Push-to-start payload asks iOS 18+ to wake the app with a fresh token")
+    func startPushCarriesInputPushToken() throws {
+        let notification = APNSStartLiveActivityNotification(
+            expiration: .immediately,
+            priority: .immediately,
+            appID: "com.example.app",
+            contentState: LiveActivityState(c: nil, h: [], se: false, pd: Date(), r: "Restarted"),
+            timestamp: 1_700_000_000,
+            attributes: JSONValue.object([:]),
+            attributesType: "ReadingAttributes",
+            alert: .init(title: .raw("Luka"), body: .raw("Glucose monitoring resumed")),
+            inputPushMethod: .token
+        )
+        let json = try #require(String(data: JSONEncoder().encode(notification), encoding: .utf8))
+        #expect(json.contains("\"input-push-token\":1"))
+        #expect(json.contains("\"event\":\"start\""))
     }
 
     @Test("Status dashboard renders each count")

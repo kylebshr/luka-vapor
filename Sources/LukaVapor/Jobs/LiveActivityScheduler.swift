@@ -7,7 +7,6 @@ import Queues
 import Dexcom
 import APNS
 import APNSCore
-import VaporAPNS
 
 /// Throttles the idle scheduler_tick heartbeat to once a minute. A reference type so the
 /// single scheduled job instance shares state across ticks.
@@ -1083,10 +1082,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         pushToStartAvailable: Bool = false,
         alert: APNSAlertNotificationContent? = nil
     ) async throws {
-        let apnsClient = switch environment {
-        case .development: await app.apns.client(.development)
-        case .production: await app.apns.client(.production)
-        }
+        let apnsClient = try app.apnsClient(for: environment)
 
         let state = LiveActivityState(
             c: latestReading,
@@ -1188,10 +1184,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         // Used when we're about to replace it with a push-to-start restart.
         dismiss: Bool = false
     ) async {
-        let apnsClient = switch environment {
-        case .development: await app.apns.client(.development)
-        case .production: await app.apns.client(.production)
-        }
+        guard let apnsClient = try? app.apnsClient(for: environment) else { return }
 
         let state = LiveActivityState(
             c: nil,
@@ -1247,9 +1240,9 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         now: Date,
         logID: String
     ) async -> Bool {
-        let apnsClient = switch environment {
-        case .development: await app.apns.client(.development)
-        case .production: await app.apns.client(.production)
+        guard let apnsClient = try? app.apnsClient(for: environment) else {
+            app.logger.error("\(logID) push-to-start skipped: APNs not configured")
+            return false
         }
 
         // Seed the new activity with the last cached reading so it renders real data
@@ -1299,7 +1292,10 @@ struct LiveActivityScheduler: AsyncScheduledJob {
             alert: .init(
                 title: .raw("Luka"),
                 body: .raw("Glucose monitoring resumed")
-            )
+            ),
+            // iOS 18+: ask the system to wake the app with a fresh update token for the
+            // new activity ("input-push-token": 1). Older devices ignore the key.
+            inputPushMethod: .token
         )
 
         do {

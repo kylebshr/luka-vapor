@@ -1,7 +1,6 @@
 import Vapor
 import APNS
 import APNSCore
-import VaporAPNS
 import Redis
 import Queues
 import QueuesRedisDriver
@@ -80,21 +79,21 @@ public func configure(_ app: Application) async throws {
             environment: .production
         )
 
-        await app.apns.containers.use(
-            apnsdev,
-            eventLoopGroupProvider: .shared(app.eventLoopGroup),
-            responseDecoder: JSONDecoder(),
-            requestEncoder: JSONEncoder(),
-            as: .development
+        app.apnsClients = APNSClients(
+            development: APNSClient(
+                configuration: apnsdev,
+                eventLoopGroupProvider: .shared(app.eventLoopGroup),
+                responseDecoder: JSONDecoder(),
+                requestEncoder: JSONEncoder()
+            ),
+            production: APNSClient(
+                configuration: apnsprod,
+                eventLoopGroupProvider: .shared(app.eventLoopGroup),
+                responseDecoder: JSONDecoder(),
+                requestEncoder: JSONEncoder()
+            )
         )
-
-        await app.apns.containers.use(
-            apnsprod,
-            eventLoopGroupProvider: .shared(app.eventLoopGroup),
-            responseDecoder: JSONDecoder(),
-            requestEncoder: JSONEncoder(),
-            as: .production
-        )
+        app.lifecycle.use(APNSClientsLifecycle())
     }
 
     // register routes
