@@ -43,6 +43,12 @@ struct StartLiveActivityRequest: Codable, Sendable {
     var pushToStartToken: String?
     var attributesType: String?      // e.g. "ReadingAttributes"
     var attributes: JSONValue?       // opaque, app-encoded ActivityAttributes (e.g. {"range": ...})
+
+    // Whether the client observed this activity as one the system started from a
+    // push-to-start push (the content-state `ps` flag), as opposed to one the user started
+    // in-app. Distinguishes a late-arriving restart registration from a fresh manual start.
+    // Optional: older clients don't send it.
+    var pushToStart: Bool?
 }
 
 extension StartLiveActivityRequest {

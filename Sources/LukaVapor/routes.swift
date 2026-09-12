@@ -93,6 +93,49 @@ func routes(_ app: Application) throws {
         return .ok
     }
 
+    // Client-side lifecycle observations (activity appeared, token arrived, send failed,
+    // app woke in the background, …), stamped with the device's own timestamps. Emitted as
+    // `client_event` rows so they line up with `push_started` / `restart_registered` for
+    // the same user. If a restart push is pending for this user, each row also carries how
+    // long after that push the observation happened.
+    app.post("client-event") { req async throws -> HTTPStatus in
+        let body = try req.content.decode(ClientEventRequest.self)
+        let now = Date.now
+        let pending = try? await LiveActivityPollKeys.peekRestartPending(for: body.username, on: req.redis)
+        let appVersion = req.headers.first(name: "X-Luka-Version") ?? "unknown"
+        let appBuild = req.headers.first(name: "X-Luka-Build") ?? "unknown"
+        let clientTime = ISO8601DateFormatter()
+        clientTime.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        var emitted = 0
+        for event in body.events.prefix(ClientEventSanitizer.maxEvents) {
+            guard let name = ClientEventSanitizer.name(event.name) else { continue }
+            let occurredAt = Date(timeIntervalSince1970: event.occurredAt)
+
+            var attributes = ClientEventSanitizer.attributes(event.attributes)
+            attributes["user"] = body.logID
+            attributes["client_event"] = name
+            attributes["client_time"] = clientTime.string(from: occurredAt)
+            attributes["client_lag_s"] = String(Int(now.timeIntervalSince(occurredAt)))
+            attributes["app_version"] = appVersion
+            attributes["app_build"] = appBuild
+            attributes["os_version"] = body.systemVersion ?? "unknown"
+            attributes["device_model"] = body.deviceModel ?? "unknown"
+            if let activityID = event.activityID {
+                attributes["activity_prefix"] = String(activityID.prefix(8))
+            }
+            if let pending {
+                attributes["restart_source"] = pending.source
+                attributes["since_restart_s"] = String(Int(occurredAt.timeIntervalSince(pending.sentAt)))
+            }
+            app.axiom?.emit("client_event", attributes: attributes)
+            emitted += 1
+        }
+
+        req.logger.info("📱 \(body.logID) Recorded \(emitted) client event(s)")
+        return .ok
+    }
+
     app.post("end-live-activities") { req async throws -> HTTPStatus in
         let body = try req.content.decode(EndLiveActivitiesRequest.self)
 
@@ -149,6 +192,7 @@ func routes(_ app: Application) throws {
         // changed. A device whose restarts stopped landing after its token rotated shows up
         // here as a token that never changes while `push_started` keeps targeting it.
         let pushToStartPrefix = body.pushToStartToken.map { String($0.prefix(8)) } ?? "none"
+        let launchedByPush = body.pushToStart.map { $0 ? "true" : "false" } ?? "unknown"
         let pushToStartChanged: String
         let pushToStartTokenUpdatedAt: Date
         if let existingToken {
@@ -244,6 +288,7 @@ func routes(_ app: Application) throws {
                 "token_count": "1",
                 "pts_prefix": pushToStartPrefix,
                 "pts_changed": pushToStartChanged,
+                "launched_by_push": launchedByPush,
             ])
         } else {
             // Existing session: don't touch the scheduler-owned state. Ensure a schedule
@@ -271,6 +316,7 @@ func routes(_ app: Application) throws {
                 "token_count": String(tokenCount),
                 "pts_prefix": pushToStartPrefix,
                 "pts_changed": pushToStartChanged,
+                "launched_by_push": launchedByPush,
             ])
         }
 
@@ -288,6 +334,7 @@ func routes(_ app: Application) throws {
                 "latency_s": String(Int(latency)),
                 "pts_prefix_sent": pendingRestart.pushToStartTokenPrefix,
                 "pts_prefix_now": pushToStartPrefix,
+                "launched_by_push": launchedByPush,
             ])
         }
 

@@ -102,6 +102,31 @@ struct LukaVaporTests {
         #expect(legacy.canRestartViaPushToStart)
     }
 
+    @Test("Client event names and attributes are bounded and can't spoof server fields")
+    func clientEventSanitizer() {
+        #expect(ClientEventSanitizer.name("activity_observed") == "activity_observed")
+        #expect(ClientEventSanitizer.name("Activity Observed") == nil)
+        #expect(ClientEventSanitizer.name("") == nil)
+        #expect(ClientEventSanitizer.name(String(repeating: "a", count: 41)) == nil)
+
+        let clean = ClientEventSanitizer.attributes([
+            "push_to_start": "true",
+            "user": "spoofed",            // reserved: dropped
+            "machine_id": "spoofed",      // reserved: dropped
+            "Bad Key": "x",               // malformed: dropped
+            "long": String(repeating: "v", count: 500),
+        ])
+        #expect(clean["push_to_start"] == "true")
+        #expect(clean["user"] == nil)
+        #expect(clean["machine_id"] == nil)
+        #expect(clean["Bad Key"] == nil)
+        #expect(clean["long"]?.count == ClientEventSanitizer.maxValueLength)
+
+        let many = Dictionary(uniqueKeysWithValues: (0..<40).map { ("k\($0)", "v") })
+        #expect(ClientEventSanitizer.attributes(many).count == ClientEventSanitizer.maxAttributes)
+        #expect(ClientEventSanitizer.attributes(nil).isEmpty)
+    }
+
     @Test("Status dashboard renders each count")
     func statusDashboardHTML() {
         let counts = LiveActivityPollKeys.ActivityCounts(sessions: 12, activities: 34, rateLimited: 5)

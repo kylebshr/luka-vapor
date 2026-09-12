@@ -133,11 +133,12 @@ enum LiveActivityPollKeys {
 
     /// Restart bookkeeping: set when a push-to-start restart is sent for a user, consumed by
     /// the next `start-live-activity` so it can report how long the device took to come
-    /// back (`restart_registered`). Short TTL — a marker nobody consumed means the device
-    /// never restarted, which is the failure the `push_started` / `restart_registered`
-    /// mismatch surfaces in Axiom.
+    /// back (`restart_registered`). Lives as long as the activity could (the 8h session
+    /// TTL): a device that only registers the restarted activity when the user next opens
+    /// the app — hours later — is still attributed to its restart, with the real latency.
+    /// A marker nobody consumed means the device never came back at all.
     static let restartPendingPrefix = "live-activities:restart-pending:"
-    static let restartPendingTTLSeconds = 15 * 60
+    static let restartPendingTTLSeconds = dataTTLSeconds
 
     static func restartPendingKey(for username: String) -> RedisKey {
         RedisKey("\(restartPendingPrefix)\(username)")
@@ -236,6 +237,14 @@ enum LiveActivityPollKeys {
             RESPValue(from: "EX"),
             RESPValue(from: String(restartPendingTTLSeconds)),
         ]).get()
+    }
+
+    /// Reads the pending-restart marker without consuming it, so client-side observations
+    /// can be stamped with how long after the restart push they happened.
+    static func peekRestartPending(for username: String, on client: any RedisClient) async throws -> RestartPending? {
+        let result = try await client.get(restartPendingKey(for: username)).get()
+        guard let raw = result.string else { return nil }
+        return try? JSONDecoder().decode(RestartPending.self, from: Data(raw.utf8))
     }
 
     /// Atomically reads and clears the pending-restart marker, if any. Only the first

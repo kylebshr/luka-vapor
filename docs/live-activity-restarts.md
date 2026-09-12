@@ -18,14 +18,35 @@ missing activity until they start one by hand, and the server has nothing to pol
 | `session_ended` reason `client_end` / `client_end_all` | app | Client-initiated teardown (`session_removed` says whether the whole session went) |
 | `session_removed` reason `missing` / `undecodable` | worker | Dead schedule entry cleaned up |
 
-The `restart_registered` event is driven by a 15-minute Redis marker
-(`live-activities:restart-pending:<username>`) written when a start push is sent and
-consumed by the next registration.
+The `restart_registered` event is driven by a Redis marker
+(`live-activities:restart-pending:<username>`, 8h TTL) written when a start push is sent
+and consumed by the next registration. `session_started` and `restart_registered` carry
+`launched_by_push` (the client's view of whether the system started the activity from a
+push), which separates a late restart registration from a manual start.
 
-Client side (TelemetryDeck, app `Luka`): `LiveActivity.activityObserved`
-(`pushToStart: true` = the device did launch the restarted activity),
-`LiveActivity.receivedToken` / `sentToken` / `failedToSendToken` (all carry `pushToStart`),
-`LiveActivity.pushToStartTokenUpdated` (`changed`), `LiveActivity.activityEnded`.
+### Client events (`client_event`)
+
+The app posts what the device saw to `POST /client-event`, batched per wake and stamped
+with the device clock. Each row has `client_event` (the name), `client_time`,
+`client_lag_s` (upload delay), `app_version` / `app_build` / `os_version` /
+`device_model`, `activity_prefix`, and — when a restart push is pending for the user —
+`restart_source` and `since_restart_s`. The route sanitizes names and attributes
+(`ClientEventSanitizer`); clients can't spoof server-stamped fields.
+
+| `client_event` | Attributes | Meaning |
+|---|---|---|
+| `app_launch` | `app_state`, `activities`, `protected_data`, `restart_enabled`, `has_pts_token` | The process came up. After a `push_started`, this in `background` state is the proof iOS woke the app. |
+| `activity_observed` | `source` (existing/updates), `push_to_start`, `state`, `reason` | The manager began observing an activity. `push_to_start=true` = the restarted activity exists on the device. |
+| `token_received` | `kind`, `push_to_start`, `token_prefix` | ActivityKit handed over the activity's push token. |
+| `token_sent` / `token_send_failed` / `token_send_skipped` | `kind`, `push_to_start`, `error` / `has_username` … | Registration outcome. `skipped` = credentials weren't readable. |
+| `push_to_start_token` | `changed`, `had_token`, `pts_prefix` | The push-to-start token stream yielded. Compare `pts_prefix` with `token_prefix` on `push_started`. |
+| `activity_ended` | `state`, `push_to_start`, `had_token` | iOS reported the activity ended or dismissed. |
+| `end_sent` / `end_send_failed` | | The client's end call. |
+
+TelemetryDeck (app `Luka`) carries the same observations as signals
+(`LiveActivity.activityObserved`, `receivedToken`, `sentToken`, `failedToSendToken`,
+`pushToStartTokenUpdated`, `activityEnded`) for fleet-level rates, but with server receipt
+timestamps only — use `client_event` for timing.
 
 ## Queries
 
@@ -48,12 +69,26 @@ Client side (TelemetryDeck, app `Luka`): `LiveActivity.activityObserved`
 | order by sent - back desc
 ```
 
-**One user's restart history** (pair each `push_started` with what followed):
+**One user's restart history** (pair each `push_started` with what followed, server and
+device side):
 ```apl
 ['luka-push']
-| where user == "<redacted id>" and event in ("push_started", "restart_registered", "session_started", "session_ended", "push_ended")
-| project _time, event, kind, reason, source, latency_s, token_prefix, pts_prefix, pts_prefix_sent, pts_prefix_now, pts_age_s, restarted_count
-| order by _time asc
+| where user == "<redacted id>" and event in ("push_started", "restart_registered", "session_started", "session_ended", "push_ended", "client_event")
+| extend when = iff(event == "client_event", todatetime(client_time), _time)
+| project when, event, client_event, kind, reason, source, latency_s, since_restart_s, app_state, push_to_start, launched_by_push, token_prefix, pts_prefix, pts_prefix_sent, pts_prefix_now, pts_age_s, restarted_count, error
+| order by when asc
+```
+
+**Did the device wake for each restart?** (`push_started` followed by a background
+`app_launch` from the same user within 2 minutes):
+```apl
+let starts = ['luka-push'] | where event == "push_started" | project user, t0=_time;
+let wakes = ['luka-push'] | where event == "client_event" and client_event == "app_launch" | project user, t1=todatetime(client_time), app_state;
+starts
+| join kind=leftouter wakes on user
+| extend delta = datetime_diff('second', t1, t0)
+| summarize woke = countif(delta >= 0 and delta <= 120) by user, t0
+| summarize restarts=count(), device_woke=countif(woke > 0) by user
 ```
 
 Monitor: **"Luka: push-to-start restarts not re-registered"** (Axiom, 60-minute window,
@@ -61,12 +96,19 @@ alerts above 6 dropped restarts) emails the same notifier as the 429 monitor.
 
 ## Reading a failure
 
-- `push_started` present, `restart_registered` absent, and TelemetryDeck shows no
-  `activityObserved pushToStart=true` → iOS did not launch the activity from the push
-  (token stale, Live Activities disabled, or system throttling). Compare `pts_prefix` on
-  the user's `session_started` events with `token_prefix` on `push_started`: if the client
-  keeps advertising the same token the server pushes to, the token itself is suspect.
-- `activityObserved pushToStart=true` but no `restart_registered` → the app was launched
-  but the registration never reached the server (`failedToSendToken`).
-- `restart_registered` with large `latency_s` → the push was delivered late (APNs stored
-  it; check the device was offline).
+After a `push_started`, look at the same user's `client_event` rows ordered by
+`client_time`:
+
+- No `app_launch` until the user opens the app, then `activity_observed push_to_start=true
+  source=existing` → iOS showed the restarted activity but never woke the app (the
+  force-quit / not-woken case). The activity sat stale until the app ran.
+- `app_launch app_state=background` but no `token_received` → the app woke and the
+  push-token stream never yielded (Apple's known timing issue; read the token directly).
+- `token_received` but `token_send_failed` / `token_send_skipped` → the app had the token
+  and couldn't register (network, or credentials unreadable in the background).
+- Nothing at all, ever, and the next activity is `launched_by_push=false` → the device
+  never started the activity (token stale, Live Activities disabled, budget, Low Power).
+  Compare `pts_prefix` on the user's `session_started` / `push_to_start_token` events with
+  `token_prefix` on `push_started`.
+- `restart_registered` with large `latency_s` and `launched_by_push=true` → the push was
+  honored but the registration only happened when the app next ran.
