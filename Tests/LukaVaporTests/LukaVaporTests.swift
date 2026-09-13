@@ -146,6 +146,30 @@ struct LukaVaporTests {
         #expect(json.contains("\"event\":\"start\""))
     }
 
+    @Test("Only a brand-new activity supersedes its device's older activities")
+    func supersedeRule() {
+        func entry(_ activityID: String, pts: String?) -> LiveActivityTokenEntry {
+            LiveActivityTokenEntry(
+                pushToken: .init(rawValue: activityID), environment: .production, preferences: nil,
+                startDate: Date(), duration: 3600, activityID: activityID,
+                pushToStartToken: pts, attributesType: nil, attributes: nil
+            )
+        }
+        let tokens = [entry("old-same-device", pts: "device-A"), entry("other-device", pts: "device-B"), entry("opted-out", pts: nil)]
+
+        // A new activity on device A replaces device A's older one and nothing else.
+        #expect(LiveActivityPollKeys.supersededActivityIDs(in: tokens, registering: "new", pushToStartToken: "device-A", isNewActivity: true) == ["old-same-device"])
+
+        // A re-registration of a known activity (rotation, foreground re-sync, or the stale
+        // request for a just-dismissed activity) must never delete a sibling — this was the
+        // path that starved a freshly started activity of updates.
+        #expect(LiveActivityPollKeys.supersededActivityIDs(in: tokens, registering: "old-same-device", pushToStartToken: "device-A", isNewActivity: false).isEmpty)
+        #expect(LiveActivityPollKeys.supersededActivityIDs(in: tokens, registering: "new", pushToStartToken: "device-A", isNewActivity: false).isEmpty)
+
+        // Opted-out clients (no push-to-start token) never match anything.
+        #expect(LiveActivityPollKeys.supersededActivityIDs(in: tokens, registering: "new", pushToStartToken: nil, isNewActivity: true).isEmpty)
+    }
+
     @Test("Status dashboard renders each count")
     func statusDashboardHTML() {
         let counts = LiveActivityPollKeys.ActivityCounts(sessions: 12, activities: 34, rateLimited: 5)

@@ -270,7 +270,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 ])
                 // Drop this device's token field. Targeted HDEL leaves every other device's
                 // token — including one that registered during this tick's poll — untouched.
-                try? await LiveActivityPollKeys.removeToken(for: username, activityID: token.activityID, on: app.redis)
+                try? await LiveActivityPollKeys.removeToken(for: username, activityID: token.activityID, reason: "max_duration", on: app.redis)
             }
 
             if session.tokens.isEmpty {
@@ -894,7 +894,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
                 "reason": reason.rawValue,
             ])
             // Drop each ended token's field individually...
-            try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, on: app.redis)
+            try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, reason: reason.rawValue, on: app.redis)
         }
 
         // ...then tear down the session only if no token registered during this tick.
@@ -1041,7 +1041,7 @@ struct LiveActivityScheduler: AsyncScheduledJob {
         // any that registered during this poll) are untouched.
         if !tokensToRemove.isEmpty {
             for token in session.tokens where tokensToRemove.contains(token.pushToken) {
-                try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, on: app.redis)
+                try? await LiveActivityPollKeys.removeToken(for: session.username, activityID: token.activityID, reason: "apns_rejected", on: app.redis)
             }
             session.tokens.removeAll { tokensToRemove.contains($0.pushToken) }
         }

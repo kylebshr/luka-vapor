@@ -17,6 +17,8 @@ missing activity until they start one by hand, and the server has nothing to pol
 | `session_started` | app | Every registration. `pts_prefix` = current push-to-start token prefix (`none` if opted out), `pts_changed` = differs from this activity's last registration (`none` = first registration) |
 | `session_ended` reason `client_end` / `client_end_all` | app | Client-initiated teardown (`session_removed` says whether the whole session went) |
 | `session_removed` reason `missing` / `undecodable` | worker | Dead schedule entry cleaned up |
+| `session_start_rejected` | app | A registration for an activity that already ended (`reason`: `max_duration`, `client_end`, `apns_rejected`, `superseded`, …) was refused with 410. Expected occasionally: the app re-registers a just-dismissed activity on wake. |
+| `session_start_failed` | app | The start route threw (undecodable body, Redis error) |
 
 The `restart_registered` event is driven by a Redis marker
 (`live-activities:restart-pending:<username>`, 8h TTL) written when a start push is sent
@@ -93,6 +95,30 @@ starts
 
 Monitor: **"Luka: push-to-start restarts not re-registered"** (Axiom, 60-minute window,
 alerts above 6 dropped restarts) emails the same notifier as the 429 monitor.
+
+## Two root causes found on 2026-09-13
+
+**Stale push-to-start token (device-side).** A device's push-to-start token rotates, and
+`pushToStartTokenUpdates` can stay silent for whole process lifetimes afterwards (seen on
+iOS 26.6: five launches, zero yields). The app kept sending the token it had persisted
+weeks earlier; APNs accepts a push to a well-formed old token without error, and the device
+never sees it. Confirmed by a `liveactivitiesd` state dump in the device log
+(`log collect --device`, then search `publicTokens`) that disagreed with the `token_prefix`
+on `push_started`. The client now reads `Activity.pushToStartToken` directly on launch, on
+foreground, and before every registration, and reports every read as a
+`push_to_start_token` client event. In Axiom, compare `pts_prefix` on a user's
+`push_to_start_token` events with `token_prefix` on their `push_started`.
+
+**Stale re-registration race (server-side).** On a wake the app observes the just-dismissed activity next to the new one; the old
+activity's token stream re-yields and the app registers it again a few milliseconds after
+the new one. The start route used to treat whichever registration arrived last as the
+newest and delete the other's token, so when the old one landed last the new activity on
+screen had no token on the server and never updated, while pushes kept going to a dismissed
+activity. Fleet-wide this starved ~4 activities a day. Two guards now close it: only a
+brand-new activity ID may supersede (`supersededActivityIDs`), and every removed activity
+is tombstoned (`live-activities:ended:<user>:<activityID>`) so a late registration for it
+is refused with 410 (`session_start_rejected`). The client skips sends for dismissed
+activities and treats 410 as "ended".
 
 ## Reading a failure
 
