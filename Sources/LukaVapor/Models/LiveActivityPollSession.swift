@@ -264,9 +264,58 @@ enum LiveActivityPollKeys {
         return try? JSONDecoder().decode(RestartPending.self, from: Data(raw.utf8))
     }
 
-    /// Removes one device's token field.
-    static func removeToken(for username: String, activityID: String, on client: any RedisClient) async throws {
+    /// Removes one device's token field and tombstones the activity (see `markActivityEnded`).
+    static func removeToken(for username: String, activityID: String, reason: String, on client: any RedisClient) async throws {
+        try await markActivityEnded(for: username, activityID: activityID, reason: reason, on: client)
         _ = try await client.hdel(tokenField(activityID), from: dataKey(for: username)).get()
+    }
+
+    // MARK: Ended-activity tombstones
+
+    /// Once an activity's token is removed — it hit its max duration, the client ended it,
+    /// APNs rejected it, or a newer activity on the same device superseded it — it must
+    /// never be registered again. The app can still send a late `start-live-activity` for
+    /// it: on a wake it observes the just-dismissed activity alongside the new one and its
+    /// token stream re-yields, and a request cancelled client-side can already be on the
+    /// wire. Without the tombstone that stale registration used to win the supersede rule
+    /// and delete the *new* activity's token, leaving it on screen with no updates.
+    static let endedPrefix = "live-activities:ended:"
+    static let endedTTLSeconds = dataTTLSeconds
+
+    static func endedKey(for username: String, activityID: String) -> RedisKey {
+        RedisKey("\(endedPrefix)\(username):\(activityID)")
+    }
+
+    static func markActivityEnded(for username: String, activityID: String, reason: String, on client: any RedisClient) async throws {
+        _ = try await client.send(command: "SET", with: [
+            RESPValue(from: endedKey(for: username, activityID: activityID).rawValue),
+            RESPValue(from: reason),
+            RESPValue(from: "EX"),
+            RESPValue(from: String(endedTTLSeconds)),
+        ]).get()
+    }
+
+    /// The reason an activity ended, if it has a tombstone.
+    static func endedReason(for username: String, activityID: String, on client: any RedisClient) async throws -> String? {
+        try await client.get(endedKey(for: username, activityID: activityID)).get().string
+    }
+
+    /// Which existing entries a registration supersedes. A push-to-start token is
+    /// per-device, so another entry carrying the same one is an older activity on the same
+    /// device that the one starting now replaced. Only a *brand-new* activity ID may
+    /// supersede: a re-registration of an activity we already know (token rotation,
+    /// foreground re-sync, or a stale request for a just-dismissed activity) says nothing
+    /// about which activity is newest and must never delete a sibling.
+    static func supersededActivityIDs(
+        in tokens: [LiveActivityTokenEntry],
+        registering activityID: String,
+        pushToStartToken: String?,
+        isNewActivity: Bool
+    ) -> [String] {
+        guard isNewActivity, let pushToStartToken else { return [] }
+        return tokens
+            .filter { $0.pushToStartToken == pushToStartToken && $0.activityID != activityID }
+            .map(\.activityID)
     }
 
     /// Loads and reassembles a full session from its per-field hash.

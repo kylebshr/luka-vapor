@@ -73,6 +73,9 @@ func routes(_ app: Application) throws {
         // push token may have rotated since the client last saw it. The HDEL and the
         // "any tokens left?" teardown check run in one atomic script, so a device registering
         // concurrently can't be wrongly dropped or leave an orphan session behind.
+        // Tombstone first so a late/stale registration for this activity racing the end
+        // call is rejected even if it lands between these two writes.
+        try await LiveActivityPollKeys.markActivityEnded(for: body.username, activityID: body.activityID, reason: "client_end", on: req.redis)
         let removed = try await LiveActivityPollKeys.pruneSession(for: body.username, removingActivityID: body.activityID, on: req.redis)
 
         if removed {
@@ -144,6 +147,7 @@ func routes(_ app: Application) throws {
         // timeout instead of being dismissed now. dismiss: true clears them immediately.
         if case .present(let session) = try? await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis) {
             for token in session.tokens {
+                try? await LiveActivityPollKeys.markActivityEnded(for: body.username, activityID: token.activityID, reason: "client_end_all", on: req.redis)
                 await LiveActivityScheduler.sendEndEvent(
                     app: req.application,
                     pushToken: token.pushToken,
@@ -189,6 +193,23 @@ func routes(_ app: Application) throws {
 
     func startLiveActivity(_ req: Request, app: Application) async throws -> HTTPStatus {
         let body = try req.content.decode(StartLiveActivityRequest.self)
+
+        // An activity that already ended (max duration, client end, APNs rejection,
+        // superseded) never comes back. The app can still send a registration for it — on
+        // a wake it observes the just-dismissed activity next to the new one and its token
+        // stream re-yields — and that stale registration used to delete the new activity's
+        // token. 410 tells the client to stop tracking it.
+        if let endedReason = try await LiveActivityPollKeys.endedReason(for: body.username, activityID: body.activityID, on: req.redis) {
+            req.logger.info("🪦 \(body.logID) Rejected registration for ended activity (\(endedReason))")
+            app.axiom?.emit("session_start_rejected", attributes: [
+                "user": body.logID,
+                "reason": endedReason,
+                "activity_prefix": String(body.activityID.prefix(8)),
+                "token_prefix": String(body.pushToken.rawValue.prefix(8)),
+                "launched_by_push": body.pushToStart.map { $0 ? "true" : "false" } ?? "unknown",
+            ])
+            return .gone
+        }
 
         let loaded = try await LiveActivityPollKeys.loadSession(for: body.username, on: req.redis)
 
@@ -262,19 +283,19 @@ func routes(_ app: Application) throws {
         )
         try await LiveActivityPollKeys.saveToken(for: body.username, tokenEntry, on: req.redis)
 
-        // A push-to-start token is per-device, so an existing entry sharing this one but
-        // keyed by a different activityID is a stale activity that's been superseded on-device
-        // by the one starting now. Drop those stale entries so the scheduler stops pushing
-        // updates to an activity that no longer exists — otherwise a single device accrues
-        // duplicate tokens and receives redundant pushes. Only the just-saved activityID is
-        // kept; nil push-to-start tokens (opted-out clients) are never matched.
-        let supersededIDs: [String] = body.pushToStartToken.map { pushToStartToken in
-            (existingSession?.tokens ?? [])
-                .filter { $0.pushToStartToken == pushToStartToken && $0.activityID != body.activityID }
-                .map(\.activityID)
-        } ?? []
+        // A brand-new activity on a device replaces whatever that device was running:
+        // drop the older entries sharing its push-to-start token so the scheduler stops
+        // pushing to activities that no longer exist. Re-registrations of a known activity
+        // never supersede (see `supersededActivityIDs`). nil push-to-start tokens
+        // (opted-out clients) are never matched.
+        let supersededIDs = LiveActivityPollKeys.supersededActivityIDs(
+            in: existingSession?.tokens ?? [],
+            registering: body.activityID,
+            pushToStartToken: body.pushToStartToken,
+            isNewActivity: existingToken == nil
+        )
         for activityID in supersededIDs {
-            try await LiveActivityPollKeys.removeToken(for: body.username, activityID: activityID, on: req.redis)
+            try await LiveActivityPollKeys.removeToken(for: body.username, activityID: activityID, reason: "superseded", on: req.redis)
         }
         if !supersededIDs.isEmpty {
             req.logger.info("🧹 \(body.logID) Removed \(supersededIDs.count) stale token(s) with same push-to-start token")
