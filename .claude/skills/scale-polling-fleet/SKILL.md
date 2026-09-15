@@ -5,10 +5,16 @@ description: Scale the Dexcom polling worker fleet up or down (add/remove shards
 
 # Scaling the Dexcom polling fleet
 
-Polling is sharded across Fly `worker<i>` process groups, each on its own machine with a
-dedicated **static egress IP**. Dexcom (behind Cloudflare) rate-limits per IP, so the goal
+Polling is sharded across Fly `worker<i>` process groups, one machine each, **each alone in
+its own Fly region** with exactly one app-scoped **static egress IP** pair allocated there
+(egress IPs are regional and picked at random within a region, so one-worker-per-region is
+what pins a shard to one IP). Dexcom (behind Cloudflare) rate-limits per IP, so the goal
 is to keep each worker IP's request rate low — **target ≤ ~40 users per shard** (steady
 state ~1 poll/user/5min ≈ ≤ ~8 req/min/IP, a normal-household shape Dexcom tolerates).
+
+Current layout: worker0=sjc (shared with the HTTP-only `app`), worker1=lax, worker2=dfw,
+worker3=ord, worker4=iad, worker5=ewr. Free North American region: `yyz`. Past that, the
+next step is one Fly app per shard.
 
 Full reference: `docs/scaling.md`. This skill is the operational checklist.
 
@@ -58,39 +64,44 @@ Add/remove `worker<i>` groups so indices are **contiguous** `0..N-1`, and set
   SHARD_COUNT = '5'
 ```
 
-## 3. Deploy
+## 3. Allocate the new region's egress IP (before the machine exists)
+
+Pick an unused region (`fly platform regions`; `yyz` is the remaining NA one) and
+allocate its pair first — a machine created afterwards egresses from it on first boot:
+
+```bash
+fly ips allocate-egress -r <region> -a luka-vapor-v2 -y
+fly ips list -a luka-vapor-v2 | grep egress      # exactly one v4 per region
+```
+
+## 4. Deploy, then move the new worker into its region
 
 Deploys ship on merge to `main` (Fly's GitHub integration). Open a PR with the fly.toml
-change and merge it — that creates the new worker machines. To deploy out of band instead:
+change and merge it — that creates the new worker machine **in `primary_region` (sjc)**,
+where it shares worker0's IP until moved. To deploy out of band instead:
 
 ```bash
 fly deploy --ha=false -a luka-vapor-v2
 ```
 
 `--ha=false` creates **one** machine per new group. Without it, Fly adds a stopped standby
-per group (harmless — `auto_start_machines=false` means only the started machine polls —
-but it clutters `machines list` and must be skipped when allocating egress IPs).
+per group — **destroy standbys** (`fly machine destroy <id>`); a started one would share
+its region's IP with the real worker.
 
-## 4. Allocate static egress IPs (the step no deploy does)
-
-Egress IPs are per-machine and only exist after the machine does. For **each new worker**,
-allocate one to its **started** machine:
+Then clone the sjc machine into its region and destroy the sjc one (the clone keeps the
+process-group metadata, so it boots as the right shard; the atomic claim covers the brief
+overlap):
 
 ```bash
-fly machines list -a luka-vapor-v2          # note the STARTED machine ID for each new worker<i>
-fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2 -y
-fly machine restart <started-machine-id> -a luka-vapor-v2   # REQUIRED — see below
-fly machines egress-ip list -a luka-vapor-v2   # verify one distinct IPv4 per worker
+fly machines list -a luka-vapor-v2                         # sjc machine ID for worker<i>
+fly machine clone <sjc-id> -r <region> -a luka-vapor-v2
+fly machine destroy <sjc-id> --force -a luka-vapor-v2
+./check-egress.sh                                          # region + source IP + reachability per worker
 ```
 
-**Restart after allocating.** A machine that booted before its egress IP was allocated
-keeps egressing from Fly's shared NAT until it reconnects. Restart it so its polls actually
-leave from the static IP — and confirm via a fresh `boot` event whose `egress_ip` equals
-the allocated IPv4 (see step 5), *not* the shared-NAT address the pre-allocation boot showed.
-
-Until this runs, the new worker polls from Fly's shared NAT pool (worse reputation than
-today), so do it right after the deploy. IPs persist across deploys but are released if a
-machine is destroyed/recreated — re-check `egress-ip list` after any machine churn.
+App-scoped IPs belong to the app, not the machine, so they survive redeploys, restarts,
+and machine recreation — no re-allocation after machine churn, as long as the machine
+stays in its region (in-place deploy updates preserve region).
 
 ## 5. Verify (Axiom, ~15–30 min after)
 
@@ -108,12 +119,14 @@ machine is destroyed/recreated — re-check `egress-ip list` after any machine c
 Remove the **highest-indexed** worker group(s) and lower `SHARD_COUNT` to match (contiguous
 indices only — a worker whose index ≥ `SHARD_COUNT` refuses to poll and orphans nothing,
 but a *gap* below the count orphans that shard). Deploy, then destroy the removed machines:
-`fly machine destroy <id> --force -a luka-vapor-v2`. Their egress IPs release automatically.
+`fly machine destroy <id> --force -a luka-vapor-v2`. The region's egress IPs stay allocated
+(and billed) until released: `fly ips release-egress <v4> <v6> -a luka-vapor-v2`.
 
 ## Safety rules (see docs/scaling.md for the full list)
 
-- **Exactly one machine per worker group.** Two machines on one shard split its users
-  across two IPs, defeating the stable-IP goal (the atomic claim still prevents double-polls).
+- **Exactly one machine per worker group, and one worker per region.** A second machine
+  in a region shares its IP (doubling load); a second IP pair in a region gets picked at
+  random, splitting a shard's users across IPs (the atomic claim still prevents double-polls).
 - **`SHARD_COUNT` must equal the worker-group count**, indices `0..N-1`, no gaps.
 - **Change groups and `SHARD_COUNT` together**; rolling-deploy skew is bounded by the
   atomic claim to a few polls from the wrong IP for a minute or two.

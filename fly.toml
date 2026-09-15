@@ -3,10 +3,14 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 # Topology: the `app` process serves HTTP only (its shard is nil, scheduler disabled);
-# each `worker<i>` process polls shard i of SHARD_COUNT from its own dedicated static
-# egress IP. SHARD_COUNT must equal the number of worker groups, with one machine per
-# group. See docs/scaling.md for the full runbook: scaling up/down, egress IP commands,
-# safety rules, rollback to single-process mode, and verification.
+# each `worker<i>` process polls shard i of SHARD_COUNT from its own static egress IP.
+# Egress IPs are app-scoped and regional (one pool per region, picked at random by the
+# machines there), so each worker lives ALONE in its own region with exactly one egress
+# IP pair allocated there: worker0=sjc (shared with `app`), worker1=lax, worker2=dfw,
+# worker3=ord, worker4=iad, worker5=ewr. Regions are a machine property, not set here —
+# a new worker group is created in primary_region and must be cloned into its own
+# region. SHARD_COUNT must equal the number of worker groups, one machine per group.
+# See docs/scaling.md for the full runbook.
 
 app = 'luka-vapor-v2'
 primary_region = 'sjc'
