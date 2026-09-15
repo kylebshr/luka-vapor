@@ -2,16 +2,18 @@
 
 ## Sharded Polling
 
-Dexcom polling is sharded across Fly worker machines (one static egress IP each) to stay
-under Dexcom's per-IP rate limits. **Read `docs/scaling.md` before changing `fly.toml`
-process groups, `SHARD_COUNT`, or machine counts** — mismatched values orphan a shard or
-split one shard across two egress IPs.
+Dexcom polling is sharded across Fly worker machines, one per region, each egressing from
+that region's single app-scoped static egress IP, to stay under Dexcom's per-IP rate
+limits. **Read `docs/scaling.md` before changing `fly.toml` process groups, `SHARD_COUNT`,
+machine counts, or machine regions** — mismatched values orphan a shard, and two machines
+in one region share (or randomly split) an egress IP.
 
 If **Live Activities stop updating fleet-wide** — worker logs full of `NSURLErrorDomain
 Code=-1001` poll timeouts and `Axiom ingest failed: connectTimeout`, worker telemetry dark
-in Axiom while the `app` machine is healthy — the workers' static egress IPs have wedged
-(a Fly host migration can silently break outbound routing while the IP still shows
-allocated). Fix: `./rotate-egress-ips.sh`. See "Wedged egress IPs" in `docs/scaling.md`.
+in Axiom — the workers' static egress IPs have wedged (a Fly host migration can silently
+break outbound routing while the IP still shows allocated). Diagnose with
+`./check-egress.sh`, fix with `./rotate-egress-ips.sh`. See "Wedged egress IPs" in
+`docs/scaling.md`.
 
 ## Job Queue Payload Changes
 

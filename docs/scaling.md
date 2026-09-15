@@ -5,12 +5,11 @@
 
 ## How polling is distributed
 
-All Dexcom polling is sharded across dedicated worker machines, each with its own
-**static egress IP**, so Dexcom sees a handful of low-volume IPs instead of one busy one
-(their rate limiting is per-IP; see the plan/discussion in the PR that introduced this).
+All Dexcom polling is sharded across dedicated worker machines, each egressing from its
+own **static egress IP**, so Dexcom sees a handful of low-volume IPs instead of one busy
+one (their rate limiting is per-IP; see the plan/discussion in the PR that introduced this).
 
-- The `app` process group serves HTTP only — it never polls, and its egress IP never
-  touches Dexcom.
+- The `app` process group serves HTTP only — it never polls and never touches Dexcom.
 - Each `worker<i>` process group runs the scheduler for shard `i` of `SHARD_COUNT`.
   A worker only claims schedule members whose stable FNV-1a username hash mod
   `SHARD_COUNT` equals its index (`Sources/LukaVapor/Sharding/Sharding.swift`).
@@ -27,68 +26,112 @@ Keep **~30–50 users per worker IP**. At a steady ~1 poll per user per 5 minute
 ≤ ~10 requests/min/IP — the traffic shape of a normal household, which Dexcom tolerates
 indefinitely. Check the current session count at `GET /activity-count`.
 
+## One worker per region: how each worker gets its own IP
+
+Egress IPs are **app-scoped** (`fly ips allocate-egress`), which is the only kind Fly
+still supports — machine-scoped IPs (`fly machine egress-ip allocate`) are retired as of
+Oct 31, 2026. App-scoped IPs are **regional**: every machine of the app in a region
+egresses through one of that region's pool IPs, picked **at random**, with no way to pin
+a machine to a particular IP. Two workers in the same region with two pool IPs would
+therefore drift between IPs (observed: they all collapse onto one), defeating the
+one-stable-IP-per-shard model.
+
+The topology that makes the random pick deterministic: **exactly one worker machine per
+region, and exactly one egress IP pair per region.** A pool of one has nothing to
+randomize.
+
+| Group   | Region | Notes                                                        |
+|---------|--------|--------------------------------------------------------------|
+| app     | sjc    | HTTP only. Shares sjc's pool IP with worker0 — harmless, it never calls Dexcom. |
+| worker0 | sjc    | `primary_region`                                             |
+| worker1 | lax    |                                                              |
+| worker2 | dfw    |                                                              |
+| worker3 | ord    |                                                              |
+| worker4 | iad    |                                                              |
+| worker5 | ewr    |                                                              |
+
+Polling is latency-insensitive, so any US region works for Dexcom. The remaining unused
+North American region is `yyz` (Toronto); beyond that, the next scale-up step is splitting
+workers into separate Fly apps (one app = one IP pool), which is Fly's own recommended
+pattern for per-machine IP isolation.
+
+Because app-scoped IPs belong to the app rather than a machine, they **survive machine
+recreation, host migration, and redeploys** — the "IP silently released" failure mode of
+the machine-scoped era is gone.
+
+Sanity check at any time — one IP pair per region, and every region with a worker:
+
+```bash
+fly ips list -a luka-vapor-v2 | grep egress
+fly machines list -a luka-vapor-v2
+```
+
 ## Scale up (add a worker)
 
-Example: going from 3 workers to 4.
+Example: going from 6 workers to 7, into region `yyz`.
 
 1. In `fly.toml`, add the new process group and bump the count — both in one change:
 
    ```toml
    [processes]
-     worker3 = 'serve --env production --hostname 0.0.0.0 --port 8080'
+     worker6 = 'serve --env production --hostname 0.0.0.0 --port 8080'
 
    [env]
-     SHARD_COUNT = '4'
+     SHARD_COUNT = '7'
    ```
 
-2. Deploy. Merging the fly.toml change to `main` deploys it (Fly GitHub integration) and
-   creates the new worker machine. To deploy out of band instead:
+2. Allocate the new region's egress IP **before** the machine exists there (Fly notes a
+   newly allocated IP can take 5–10 minutes to apply to already-running machines; a
+   machine created after allocation uses it from its first boot):
+
+   ```bash
+   fly ips allocate-egress -r yyz -a luka-vapor-v2 -y
+   ```
+
+3. Deploy. Merging the fly.toml change to `main` deploys it (Fly GitHub integration) and
+   creates the new worker machine — in `primary_region` (sjc), where it would share
+   worker0's IP. To deploy out of band instead:
 
    ```bash
    fly deploy --ha=false -a luka-vapor-v2
    ```
 
    Pass `--ha=false` so Fly creates **one** machine per new group. Without it, each group
-   also gets a **stopped standby** machine. The standby is harmless for correctness —
-   `auto_start_machines = false` means only the started machine runs the scheduler — but it
-   clutters `machines list` and you must skip it in the next step.
+   also gets a **stopped standby** machine; destroy any standby (`fly machine destroy
+   <id>`) — if one ever started it would share its region's IP with the real worker.
 
-3. Allocate the new worker's static egress IP to its **started** machine, and verify every
-   worker has a distinct one:
+4. Move the new worker out of sjc into its region, then remove the sjc one:
 
    ```bash
-   fly machines list -a luka-vapor-v2                       # started machine ID for worker3
-   fly machines egress-ip allocate <started-machine-id> -a luka-vapor-v2 -y
-   fly machine restart <started-machine-id> -a luka-vapor-v2   # apply the IP (see note)
-   fly machines egress-ip list -a luka-vapor-v2             # one distinct IPv4 per worker
+   fly machines list -a luka-vapor-v2                        # sjc machine ID for worker6
+   fly machine clone <sjc-machine-id> -r yyz -a luka-vapor-v2
+   fly machine destroy <sjc-machine-id> --force -a luka-vapor-v2
    ```
 
-   **Restart after allocating.** If the machine booted before the IP was allocated, it keeps
-   egressing from shared NAT until it reconnects — restart it, then confirm the new `boot`
-   event's `egress_ip` matches the allocated IPv4 (not the shared-NAT address the first boot
-   logged).
+   Cloning copies the process-group metadata, so the clone boots as shard 6. Both
+   machines briefly own the shard; the atomic claim keeps that harmless.
 
-4. Verify in logs/Axiom (see “Verifying a change” below).
+5. Verify (see "Verifying a change"). Quick check from the box itself:
+
+   ```bash
+   ./check-egress.sh          # every started worker: region, egress source IP, reachability
+   ```
 
 ## Scale down (remove a worker)
 
-Example: going from 4 workers back to 3. Remove the **highest-indexed** group so the
-remaining indices stay contiguous (`worker0..worker2` for `SHARD_COUNT = 3`) — a worker
+Example: going from 7 workers back to 6. Remove the **highest-indexed** group so the
+remaining indices stay contiguous (`worker0..worker5` for `SHARD_COUNT = 6`) — a worker
 whose index ≥ `SHARD_COUNT` refuses to poll.
 
-1. In `fly.toml`, delete the `worker3` line and set `SHARD_COUNT = '3'`.
-2. Deploy, then destroy the group's machine:
+1. In `fly.toml`, delete the `worker6` line and set `SHARD_COUNT = '6'`.
+2. Deploy, then destroy the group's machine and release the now-unused region's IPs
+   (they are billed while allocated):
 
    ```bash
    fly deploy
-   fly scale count worker3=0 -a luka-vapor-v2 -y
-   ```
-
-3. The destroyed machine's egress IP is released automatically. Re-check the survivors —
-   machine recreation can silently drop an egress IP, reverting that worker to shared NAT:
-
-   ```bash
-   fly machines egress-ip list -a luka-vapor-v2
+   fly scale count worker6=0 -a luka-vapor-v2 -y
+   fly ips list -a luka-vapor-v2 | grep yyz
+   fly ips release-egress <v4> <v6> -a luka-vapor-v2
    ```
 
 Sessions previously owned by the removed shard are re-owned by the remaining workers on
@@ -98,32 +141,27 @@ polls during the deploy.
 ## Deploys triggered from GitHub merges
 
 Merge-triggered `fly deploy` handles almost everything: process groups and `SHARD_COUNT`
-come from the repo's `fly.toml`, new worker groups get one machine each created
-automatically, and existing machines are updated **in place** — which preserves their
-static egress IPs. Ordinary merges therefore need no manual follow-up.
+come from the repo's `fly.toml`, and existing machines are updated **in place**, which
+preserves their region and therefore their egress IP. Ordinary merges need no manual
+follow-up.
 
-The exception is **egress IP allocation, which no deploy can do** — it's tied to machine
-IDs that only exist after the deploy creates the machine. After the first deploy that
-introduces sharding, and after any deploy that adds a worker group, run the allocate
-commands from "Scale up" above. Until then the new worker polls from Fly's *shared*
-egress pool (the worst IP reputation), so don't leave it long. Likewise, if Fly ever
-recreates a machine (host migration, scale down/up), its egress IP is released — a
-periodic `fly machines egress-ip list` check, or an Axiom alert on a `boot` event whose
-`egress_ip` changed, catches this.
+The exception is a **new worker group**: the deploy creates its machine in
+`primary_region` (sjc), so it needs the clone-to-region step from "Scale up" above. Until
+then it polls from sjc's IP alongside worker0, roughly doubling that IP's load — not an
+outage, but don't leave it long.
 
 When a merge *removes* a worker group, verify the machine is actually gone
 (`fly machines list`) and scale it to zero if it lingers.
 
 ## Wedged egress IPs (outbound timeouts)
 
-**This has taken the whole polling fleet down.** Machine-scoped egress IPs can *wedge*:
-when Fly migrates a worker to a new host (or otherwise rebuilds its network namespace),
-the egress binding can silently break. The IP still shows as allocated in
-`fly machine egress-ip list`, but **all outbound traffic through it times out** — this is
-distinct from the "IP got released" case in the section above, and a `fly machine
-egress-ip list` check does **not** catch it because the allocation still looks fine.
+**This took the whole polling fleet down** in the machine-scoped era: a Fly host migration
+would rebuild a worker's network namespace and silently break its egress binding. The IP
+still showed as allocated, but **all outbound traffic through it timed out**. App-scoped
+IPs are designed around machines being rescheduled, so this may no longer happen — but
+keep the diagnosis and fix path until that's proven over time.
 
-Symptoms (all at once, across every worker, and surviving a redeploy):
+Symptoms (across one or more workers, surviving a redeploy):
 
 - Every poll fails: `🚫 Error polling for session: Error Domain=NSURLErrorDomain
   Code=-1001` (`-1001` = request timed out). Sessions eventually force-end with
@@ -134,24 +172,18 @@ Symptoms (all at once, across every worker, and surviving a redeploy):
   flatline while `session_started` keeps coming. That is misleading — those worker events
   vanish because the workers can't *reach* Axiom, not because the scheduler stopped. Trust
   the Fly logs (`fly logs --machine <id>`) over Axiom silence here.
-- The `app` machine is completely healthy throughout — it has no egress IP and uses
-  shared NAT, so its outbound path is unaffected. That app-healthy / workers-dead split
-  is the tell that this is an egress problem, not app code.
+- If it's IP-level, the `app` machine is affected too now (it shares sjc's IP with
+  worker0) — so an app-healthy / workers-dead split points at something else.
 
-Confirm it by comparing outbound reachability from a worker vs. the app machine (DNS
-still works; it's TCP that hangs):
+Confirm it by probing outbound reachability from each worker:
 
 ```bash
-probe='for t in share2.dexcom.com:443 api.axiom.co:443; do echo Q | timeout 12 \
-  openssl s_client -connect $t -servername ${t%:*} -brief >/dev/null 2>&1 \
-  && echo "$t OK" || echo "$t FAIL"; done'
-fly ssh console -a luka-vapor-v2 --machine <worker-id> -C "/bin/sh -c '$probe'"  # FAIL
-fly ssh console -a luka-vapor-v2 --machine <app-id>    -C "/bin/sh -c '$probe'"  # OK
+./check-egress.sh          # prints reach dexcom / reach axiom OK|FAIL + source IP per worker
 ```
 
-Fix: release + reallocate each worker's egress IP (you get fresh IPs — fine, even good,
-for Dexcom's per-IP limits). Use the helper, which rotates every started worker one at a
-time and verifies reachability after each:
+Fix: rotate the affected worker's **region** IP — release it, allocate a fresh pair in the
+same region, restart the machine. You get a fresh IP, which is fine (even good) for
+Dexcom's per-IP limits. The helper does all three and re-probes:
 
 ```bash
 ./rotate-egress-ips.sh          # all workers (prompts first); -y to skip, -n to dry-run
@@ -168,24 +200,20 @@ timing out (~35–60% of them, worst on the least-frequently-polled sessions) ev
 `openssl s_client` from the box connects instantly on a fresh connection. `fly machine
 restart <id>` flushes both pools and clears it immediately. `rotate-egress-ips.sh` does
 this automatically after each reallocation; if you rotate by hand, restart the machine.
+Rotating sjc also restarts the `app` machine, since it shares that IP.
 
 If reallocation + restart doesn't fix it, the next steps are destroying + recreating the
-wedged machine (then reallocating), and failing that, treating it as a Fly platform
-incident. **Set the alert:** a shard with no `scheduler_tick` for >2 minutes (see
-"Verifying a change") is the earliest signal of this.
-
-> App-scoped egress IPs (`fly ips allocate-egress`) are Fly's more resilient alternative —
-> a pool owned by the app that survives machine recreation — but machines pick a pool IP
-> *at random*, which breaks the one-stable-IP-per-shard model this design relies on
-> (observed: with a fresh pool, every worker egressed through the *same* pool IP,
-> concentrating all Dexcom load on one IP). We deliberately stay on machine-scoped IPs and
-> rotate them when they wedge.
+wedged machine in the same region (`fly machine clone`, then destroy the old one), and
+failing that, treating it as a Fly platform incident. **Set the alert:** a shard with no
+`scheduler_tick` for >2 minutes (see "Verifying a change") is the earliest signal of this.
 
 ## Rules that keep this safe
 
-- **Exactly one machine per worker group.** `fly scale count worker1=2` would put two
-  machines on the same shard; the atomic claim prevents double-polling, but the shard's
-  users would alternate between two egress IPs, defeating the stable-IP goal.
+- **Exactly one machine per worker group, and exactly one worker per region.** A second
+  machine in a region — a standby, a lingering pre-clone machine, or two groups placed in
+  the same region — shares that region's IP, doubling its load; two IP pairs in one
+  region get picked at random, splitting a shard's users across IPs. The atomic claim
+  prevents double-polling either way, but the stable-IP goal is lost.
 - **`SHARD_COUNT` must equal the number of worker groups**, and worker indices must be
   `0..SHARD_COUNT-1` with no gaps. A gap means an orphaned shard: those users' schedule
   entries stay due, their activities go stale, and their Redis hashes self-expire after
@@ -204,19 +232,20 @@ Revert `fly.toml` to no `[processes]` section (or just an `app` group) and **rem
 
 ```bash
 fly deploy
-fly scale count worker0=0 worker1=0 worker2=0 -a luka-vapor-v2 -y
+fly scale count worker0=0 worker1=0 worker2=0 worker3=0 worker4=0 worker5=0 -a luka-vapor-v2 -y
 ```
 
 With `SHARD_COUNT` unset the process falls back to legacy mode — shard (0, 1) — and the
-single `app` machine polls everything from its own IP again, exactly the pre-sharding
-behavior. This is also how local dev runs.
+single `app` machine polls everything from its own IP again (sjc's pool IP), exactly the
+pre-sharding behavior. This is also how local dev runs.
 
 ## Verifying a change
 
 1. **Logs**: each worker logs `Scheduler enabled for shard i/N` on boot; the app machine
    logs `Scheduler disabled (HTTP-only process)`.
 2. **Axiom** (all events carry `machine_id`, `process_group`, `shard` automatically):
-   - one `boot` event per machine with a distinct `egress_ip` per worker;
+   - one `boot` event per machine with a distinct `egress_ip` per worker (the `app`
+     machine's matches worker0's — expected);
    - `scheduler_tick` present for every shard `0..N-1` (a shard with no beats for
      >2 minutes is down or orphaned — this is the alert to set);
    - `poll` events per shard sum to roughly the pre-change total
