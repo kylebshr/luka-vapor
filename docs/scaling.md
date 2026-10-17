@@ -49,11 +49,12 @@ randomize.
 | worker3 | ord    |                                                              |
 | worker4 | iad    |                                                              |
 | worker5 | ewr    |                                                              |
+| worker6 | yyz    |                                                              |
 
-Polling is latency-insensitive, so any US region works for Dexcom. The remaining unused
-North American region is `yyz` (Toronto); beyond that, the next scale-up step is splitting
-workers into separate Fly apps (one app = one IP pool), which is Fly's own recommended
-pattern for per-machine IP isolation.
+Polling is latency-insensitive, so any US region works for Dexcom. Every North American
+region is now in use; the next scale-up step is splitting workers into separate Fly apps
+(one app = one IP pool), which is Fly's own recommended pattern for per-machine IP
+isolation.
 
 Because app-scoped IPs belong to the app rather than a machine, they **survive machine
 recreation, host migration, and redeploys** — the "IP silently released" failure mode of
@@ -232,7 +233,7 @@ Revert `fly.toml` to no `[processes]` section (or just an `app` group) and **rem
 
 ```bash
 fly deploy
-fly scale count worker0=0 worker1=0 worker2=0 worker3=0 worker4=0 worker5=0 -a luka-vapor-v2 -y
+fly scale count worker0=0 worker1=0 worker2=0 worker3=0 worker4=0 worker5=0 worker6=0 -a luka-vapor-v2 -y
 ```
 
 With `SHARD_COUNT` unset the process falls back to legacy mode — shard (0, 1) — and the
