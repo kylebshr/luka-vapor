@@ -7,9 +7,9 @@
 # Egress IPs are app-scoped and regional (one pool per region, picked at random by the
 # machines there), so each worker lives ALONE in its own region with exactly one egress
 # IP pair allocated there: worker0=sjc (shared with `app`), worker1=lax, worker2=dfw,
-# worker3=ord, worker4=iad, worker5=ewr. Regions are a machine property, not set here —
-# a new worker group is created in primary_region and must be cloned into its own
-# region. SHARD_COUNT must equal the number of worker groups, one machine per group.
+# worker3=ord, worker4=iad, worker5=ewr, worker6=yyz. Regions are a machine property, not
+# set here — a new worker group is created in primary_region and must be cloned into its
+# own region. SHARD_COUNT must equal the number of worker groups, one machine per group.
 # See docs/scaling.md for the full runbook.
 
 app = 'luka-vapor-v2'
@@ -25,6 +25,7 @@ primary_region = 'sjc'
   worker3 = 'serve --env production --hostname 0.0.0.0 --port 8080'
   worker4 = 'serve --env production --hostname 0.0.0.0 --port 8080'
   worker5 = 'serve --env production --hostname 0.0.0.0 --port 8080'
+  worker6 = 'serve --env production --hostname 0.0.0.0 --port 8080'
 
 [http_service]
   internal_port = 8080
@@ -36,7 +37,7 @@ primary_region = 'sjc'
 
 [env]
   LOG_LEVEL = 'info'
-  SHARD_COUNT = '6'
+  SHARD_COUNT = '7'
 
 [[vm]]
   memory = '256mb'

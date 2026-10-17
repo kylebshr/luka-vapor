@@ -13,7 +13,7 @@ is to keep each worker IP's request rate low — **target ≤ ~40 users per shar
 state ~1 poll/user/5min ≈ ≤ ~8 req/min/IP, a normal-household shape Dexcom tolerates).
 
 Current layout: worker0=sjc (shared with the HTTP-only `app`), worker1=lax, worker2=dfw,
-worker3=ord, worker4=iad, worker5=ewr. Free North American region: `yyz`. Past that, the
+worker3=ord, worker4=iad, worker5=ewr, worker6=yyz. No free North American regions remain; the
 next step is one Fly app per shard.
 
 Full reference: `docs/scaling.md`. This skill is the operational checklist.
